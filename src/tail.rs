@@ -9,13 +9,14 @@ use crate::parser::{LogFormat, parse_line};
 use crate::templates::render_line;
 
 pub fn start_watcher(state: Arc<AppState>) {
-    let logs_dir = state.args.logs_dir.clone();
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
 
     let mut watcher = notify::recommended_watcher(tx).expect("failed to create file watcher");
-    watcher
-        .watch(&logs_dir, RecursiveMode::Recursive)
-        .expect("failed to watch logs directory");
+    for dir in &state.logs_dirs {
+        watcher
+            .watch(dir, RecursiveMode::Recursive)
+            .expect("failed to watch logs directory");
+    }
 
     tokio::task::spawn_blocking(move || {
         let _watcher = watcher;
@@ -94,12 +95,17 @@ fn read_new_bytes(path: &PathBuf, positions: &mut HashMap<PathBuf, u64>) -> Stri
 }
 
 fn resolve_channel(path: &PathBuf, state: &AppState) -> Option<(String, LogFormat)> {
-    let logs_dir = std::fs::canonicalize(&state.args.logs_dir).ok()?;
     let abs = std::fs::canonicalize(path).ok()?;
-    let rel = abs.parent()?.strip_prefix(&logs_dir).ok()?;
-    let segments: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
-
-    find_channel_in_tree(&state.channels, &segments, 0)
+    let parent = abs.parent()?;
+    for logs_dir in &state.logs_dirs {
+        if let Ok(rel) = parent.strip_prefix(logs_dir) {
+            let segments: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+            if let Some(result) = find_channel_in_tree(&state.channels, &segments, 0) {
+                return Some(result);
+            }
+        }
+    }
+    None
 }
 
 fn find_channel_in_tree(

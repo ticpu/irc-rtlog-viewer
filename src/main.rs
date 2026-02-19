@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 
@@ -16,13 +17,35 @@ use parser::LogFormat;
 
 #[derive(Parser)]
 #[command(version, about = "IRC log viewer")]
-pub struct Args {
-    #[arg(short = 'l', long, default_value = "./logs")]
-    logs_dir: PathBuf,
-    #[arg(short, long, default_value = "0.0.0.0:8080")]
-    bind: String,
-    #[arg(short, long, default_value = "IRC Logs")]
-    title: String,
+struct Cli {
+    #[arg(short, long, default_value = "config.yaml")]
+    config: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    #[serde(default = "default_title")]
+    pub title: String,
+    #[serde(default = "default_search_limit")]
+    pub search_limit: usize,
+    pub logs_dirs: Vec<PathBuf>,
+}
+
+fn default_bind() -> String { "0.0.0.0:8080".into() }
+fn default_title() -> String { "IRC Logs".into() }
+fn default_search_limit() -> usize { 10000 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bind: default_bind(),
+            title: default_title(),
+            search_limit: default_search_limit(),
+            logs_dirs: vec![PathBuf::from("./logs")],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,25 +63,52 @@ pub struct ChannelNode {
 }
 
 pub struct AppState {
-    pub args: Args,
+    pub config: Config,
+    pub logs_dirs: Vec<PathBuf>,
     pub channels: ChannelNode,
     pub sse_senders: RwLock<HashMap<String, broadcast::Sender<String>>>,
 }
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
-    let logs_dir = std::fs::canonicalize(&args.logs_dir).unwrap_or_else(|e| {
-        eprintln!("cannot access logs dir {:?}: {e}", args.logs_dir);
-        std::process::exit(1);
-    });
+    let cli = Cli::parse();
+
+    let config: Config = if cli.config.exists() {
+        let content = std::fs::read_to_string(&cli.config).unwrap_or_else(|e| {
+            eprintln!("cannot read config {:?}: {e}", cli.config);
+            std::process::exit(1);
+        });
+        serde_yaml::from_str(&content).unwrap_or_else(|e| {
+            eprintln!("invalid config {:?}: {e}", cli.config);
+            std::process::exit(1);
+        })
+    } else {
+        let config = Config::default();
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        std::fs::write(&cli.config, &yaml).unwrap_or_else(|e| {
+            eprintln!("cannot write default config {:?}: {e}", cli.config);
+            std::process::exit(1);
+        });
+        eprintln!("created default config {:?}, edit and restart", cli.config);
+        std::process::exit(0);
+    };
+
+    let logs_dirs: Vec<PathBuf> = config.logs_dirs.iter().map(|d| {
+        std::fs::canonicalize(d).unwrap_or_else(|e| {
+            eprintln!("cannot access logs dir {d:?}: {e}");
+            std::process::exit(1);
+        })
+    }).collect();
 
     let mut root = ChannelNode::default();
-    discover_channels(&logs_dir, &[], &mut root);
+    for dir in &logs_dirs {
+        discover_channels(dir, &[], &mut root);
+    }
 
-    let bind = args.bind.clone();
+    let bind = config.bind.clone();
     let state = Arc::new(AppState {
-        args: Args { logs_dir, ..args },
+        config,
+        logs_dirs,
         channels: root,
         sse_senders: RwLock::new(HashMap::new()),
     });

@@ -28,12 +28,10 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Response {
-    if let Some(first) = first_channel(&state.channels) {
-        let encoded = first.path_segments.join("/").replace('#', "%23");
-        Redirect::temporary(&format!("/{encoded}/today")).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "no channels found").into_response()
-    }
+    templates::page(&state.config.title, &state.channels, maud::html! {
+        h1 { (&state.config.title) }
+        p { "Select a channel from the sidebar." }
+    }).into_response()
 }
 
 async fn serve_css() -> impl IntoResponse {
@@ -77,9 +75,9 @@ async fn wildcard(
         if let Some(channel) = find_channel(&state.channels, channel_segments).cloned() {
             return match action {
                 "today" => {
-                    let today = today_date();
                     let encoded = channel.path_segments.join("/").replace('#', "%23");
-                    Redirect::temporary(&format!("/{encoded}/{today}")).into_response()
+                    let date = latest_date(&channel.fs_path);
+                    Redirect::temporary(&format!("/{encoded}/{date}")).into_response()
                 }
                 "latest" => serve_sse(state, &channel).await.into_response(),
                 "search" => {
@@ -98,11 +96,11 @@ async fn wildcard(
         }
     }
 
-    // Maybe bare channel path → redirect to today
+    // Maybe bare channel path → redirect to latest date
     if let Some(channel) = find_channel(&state.channels, &segments) {
-        let today = today_date();
         let encoded = channel.path_segments.join("/").replace('#', "%23");
-        return Redirect::temporary(&format!("/{encoded}/{today}")).into_response();
+        let date = latest_date(&channel.fs_path);
+        return Redirect::temporary(&format!("/{encoded}/{date}")).into_response();
     }
 
     (StatusCode::NOT_FOUND, "not found").into_response()
@@ -178,18 +176,6 @@ fn find_channel<'a>(
     current.channel.as_ref()
 }
 
-fn first_channel(node: &crate::ChannelNode) -> Option<&crate::Channel> {
-    if let Some(ch) = &node.channel {
-        return Some(ch);
-    }
-    for child in node.children.values() {
-        if let Some(ch) = first_channel(child) {
-            return Some(ch);
-        }
-    }
-    None
-}
-
 fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Response {
     let path = resolve_log_path(&channel.fs_path, date);
     let content = match path.and_then(|p| read_log_file(&p).ok()) {
@@ -211,7 +197,7 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
     let is_today = date == today_date();
 
     templates::log_page(&templates::LogPageContext {
-        title: &state.args.title,
+        title: &state.config.title,
         tree: &state.channels,
         channel,
         date,
@@ -223,8 +209,8 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
 }
 
 fn serve_search(state: &AppState, channel: &crate::Channel, query: &str) -> Response {
-    let results = search_channel(&channel.fs_path, channel.format, query, 200);
-    templates::search_page(&state.args.title, &state.channels, channel, query, &results)
+    let results = search_channel(&channel.fs_path, channel.format, query, state.config.search_limit);
+    templates::search_page(&state.config.title, &state.channels, channel, query, &results)
         .into_response()
 }
 
@@ -285,6 +271,11 @@ pub fn resolve_log_path(dir: &Path, date: &str) -> Option<std::path::PathBuf> {
         return Some(zst);
     }
     None
+}
+
+fn latest_date(dir: &Path) -> String {
+    let dates = list_dates(dir);
+    dates.last().cloned().unwrap_or_else(today_date)
 }
 
 fn list_dates(dir: &Path) -> Vec<String> {
