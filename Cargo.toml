@@ -1,0 +1,23 @@
+[package]
+name = "irc-log-viewer"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+authors = ["Jérôme Poulin <jeromepoulin@gmail.com>"]
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "matched-path", "original-uri", "query"] }
+clap = { version = "4", features = ["derive"] }
+maud = { version = "0.27", features = ["axum"] }
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "net"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+zstd = "0.13"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
