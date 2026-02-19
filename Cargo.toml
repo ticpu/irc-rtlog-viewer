@@ -12,7 +12,7 @@ maud = { version = "0.27", features = ["axum"] }
 notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "net"] }
+tokio = { version = "1", features = ["rt", "macros", "fs", "sync", "net"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 zstd = "0.13"
 

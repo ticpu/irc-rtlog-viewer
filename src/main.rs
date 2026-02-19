@@ -69,7 +69,7 @@ pub struct AppState {
     pub sse_senders: RwLock<HashMap<String, broadcast::Sender<String>>>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
 
