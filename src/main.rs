@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::sync::broadcast;
 
+mod ai;
 mod parser;
 mod search;
 mod server;
@@ -31,11 +32,15 @@ pub struct Config {
     #[serde(default = "default_search_limit")]
     pub search_limit: usize,
     pub logs_dirs: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<AiConfig>,
 }
 
 fn default_bind() -> String { "0.0.0.0:8080".into() }
 fn default_title() -> String { "IRC Logs".into() }
 fn default_search_limit() -> usize { 10000 }
+fn default_ai_model() -> String { "claude-haiku-4-5-20251001".into() }
+fn default_ai_max_concurrent() -> usize { 1 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -44,8 +49,21 @@ impl Default for Config {
             title: default_title(),
             search_limit: default_search_limit(),
             logs_dirs: vec![PathBuf::from("./logs")],
+            ai: None,
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AiConfig {
+    pub api_key: String,
+    #[serde(default = "default_ai_model")]
+    pub model: String,
+    pub output_dir: PathBuf,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_ai_max_concurrent")]
+    pub max_concurrent: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +90,8 @@ pub struct AppState {
     pub logs_dirs: Vec<PathBuf>,
     pub channels: ChannelNode,
     pub sse_senders: RwLock<HashMap<String, broadcast::Sender<String>>>,
+    pub ai_semaphore: Option<Arc<Semaphore>>,
+    pub reqwest_client: Option<reqwest::Client>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -89,7 +109,15 @@ async fn main() {
         })
     } else {
         let config = Config::default();
-        let yaml = serde_yaml::to_string(&config).unwrap();
+        let mut yaml = serde_yaml::to_string(&config).unwrap();
+        yaml.push_str(concat!(
+            "#ai:\n",
+            "#  api_key: sk-ant-api03-...\n",
+            "#  model: claude-haiku-4-5-20251001\n",
+            "#  output_dir: /var/lib/irc-logs/ask\n",
+            "#  base_url: https://example.com/ask\n",
+            "#  max_concurrent: 1\n",
+        ));
         std::fs::write(&cli.config, &yaml).unwrap_or_else(|e| {
             eprintln!("cannot write default config {:?}: {e}", cli.config);
             std::process::exit(1);
@@ -111,11 +139,23 @@ async fn main() {
     }
 
     let bind = config.bind.clone();
+    let (ai_semaphore, reqwest_client) = match &config.ai {
+        Some(ai) => {
+            eprintln!("ai: enabled, model={}, max_concurrent={}", ai.model, ai.max_concurrent);
+            (
+                Some(Arc::new(Semaphore::new(ai.max_concurrent))),
+                Some(reqwest::Client::new()),
+            )
+        }
+        None => (None, None),
+    };
     let state = Arc::new(AppState {
         config,
         logs_dirs,
         channels: root,
         sse_senders: RwLock::new(HashMap::new()),
+        ai_semaphore,
+        reqwest_client,
     });
 
     tail::start_watcher(Arc::clone(&state));

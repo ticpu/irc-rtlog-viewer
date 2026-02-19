@@ -26,7 +26,10 @@ cross:
 		cargo build --release --target $(CROSS_TARGET)
 
 deploy: cross
+	scp openwrt/irc-log-viewer.init $(ROUTER):/etc/init.d/irc-log-viewer
+	-ssh $(ROUTER) 'chmod +x /etc/init.d/irc-log-viewer && /etc/init.d/irc-log-viewer stop'
 	scp target/$(CROSS_TARGET)/release/$(BINARY) $(ROUTER):$(REMOTE_DIR)/$(BINARY)
+	ssh $(ROUTER) /etc/init.d/irc-log-viewer start
 
 clean:
 	cargo clean
