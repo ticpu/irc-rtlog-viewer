@@ -16,28 +16,30 @@ pub enum SseEvent {
     Error(String),
 }
 
+const DEFAULT_SYSTEM_PROMPT: &str = "\
+You are an IRC log search assistant. Search IRC logs using tools and compile relevant excerpts into an output document.
+
+Workflow:
+1. Use display to tell the user what you're searching for
+2. Use search to find relevant messages (use n first to gauge volume, then C for context)
+3. Use copy to include relevant log lines in the output
+4. Use output to add titles, separators, and factual summaries
+5. Use done to save and finish -- you MUST always call done to produce a result
+
+Rules:
+- Only retrieve and summarize IRC log content
+- Summaries must be grounded in the log data -- no speculation
+- If the query is unrelated to IRC log search, call abort immediately
+- NEVER respond with just text -- always produce an output document via done
+- Format all output text as markdown (headings, lists, code blocks for log excerpts)
+";
+
 fn build_system_prompt(state: &AppState) -> String {
-    let mut prompt = String::from(
-        "You are an IRC log search assistant. Search IRC logs using tools and compile relevant excerpts into an output document.\n\
-         \n\
-         Available channels:\n",
-    );
+    let ai_config = state.config.ai.as_ref().unwrap();
+    let base = ai_config.system_prompt.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT);
+    let mut prompt = String::from(base);
+    prompt.push_str("\nAvailable channels:\n");
     collect_channels(&state.channels, &mut prompt);
-    prompt.push_str(
-        "\nWorkflow:\n\
-         1. Use display to tell the user what you're searching for\n\
-         2. Use search to find relevant messages (use n first to gauge volume, then C for context)\n\
-         3. Use copy to include relevant log lines in the output\n\
-         4. Use output to add titles, separators, and factual summaries\n\
-         5. Use done to save and finish -- you MUST always call done to produce a result\n\
-         \n\
-         Rules:\n\
-         - Only retrieve and summarize IRC log content\n\
-         - Summaries must be grounded in the log data -- no speculation\n\
-         - If the query is unrelated to IRC log search, call abort immediately\n\
-         - NEVER respond with just text -- always produce an output document via done\n\
-         - Format all output text as markdown (headings, lists, code blocks for log excerpts)\n",
-    );
     prompt
 }
 
@@ -496,9 +498,11 @@ pub async fn run_ai_session(
         last_tool["cache_control"] = json!({"type": "ephemeral"});
     }
 
+    let max_tool_calls = ai_config.max_tool_calls;
+
     let mut output_buf = String::new();
 
-    for _iteration in 0..100 {
+    for _iteration in 0..max_tool_calls {
         let msg_json = serde_json::to_string(&messages).unwrap_or_default();
         if msg_json.len() > 150_000 {
             let _ = tx.send(SseEvent::Error("context limit reached".into()));

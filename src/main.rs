@@ -44,6 +44,7 @@ fn default_title() -> String { "IRC Logs".into() }
 fn default_search_limit() -> usize { 10000 }
 fn default_ai_model() -> String { "claude-haiku-4-5-20251001".into() }
 fn default_ai_max_concurrent() -> usize { 1 }
+fn default_ai_max_tool_calls() -> usize { 100 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -64,10 +65,12 @@ pub struct AiConfig {
     #[serde(default = "default_ai_model")]
     pub model: String,
     pub output_dir: PathBuf,
-    #[serde(default)]
-    pub base_url: Option<String>,
     #[serde(default = "default_ai_max_concurrent")]
     pub max_concurrent: usize,
+    #[serde(default = "default_ai_max_tool_calls")]
+    pub max_tool_calls: usize,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,8 +123,11 @@ async fn main() {
             "#  api_key: sk-ant-api03-...\n",
             "#  model: claude-haiku-4-5-20251001\n",
             "#  output_dir: /var/lib/irc-logs/ask\n",
-            "#  base_url: https://example.com/ask\n",
             "#  max_concurrent: 1\n",
+            "#  max_tool_calls: 100\n",
+            "#  system_prompt: |\n",
+            "#    Custom system prompt text here.\n",
+            "#    The channel list is always appended automatically.\n",
         ));
         std::fs::write(&cli.config, &yaml).unwrap_or_else(|e| {
             eprintln!("cannot write default config {:?}: {e}", cli.config);
