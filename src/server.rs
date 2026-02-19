@@ -29,7 +29,7 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Response {
-    templates::page(&state.config.title, &state.channels, maud::html! {
+    templates::page(&state.config.title, &state.channels, &state.config.base_path, maud::html! {
         h1 { (&state.config.title) }
         p { "Select a channel from the sidebar." }
     }).into_response()
@@ -88,9 +88,10 @@ async fn wildcard(
         if let Some(channel) = find_channel(&state.channels, channel_segments).cloned() {
             return match action {
                 "today" => {
+                    let bp = &state.config.base_path;
                     let encoded = channel.path_segments.join("/").replace('#', "%23");
                     let date = latest_date(&channel);
-                    Redirect::temporary(&format!("/{encoded}/{date}")).into_response()
+                    Redirect::temporary(&format!("{bp}/{encoded}/{date}")).into_response()
                 }
                 "latest" => serve_sse(state, &channel).await.into_response(),
                 "search" => {
@@ -112,9 +113,10 @@ async fn wildcard(
 
     // Maybe bare channel path → redirect to latest date
     if let Some(channel) = find_channel(&state.channels, &segments) {
+        let bp = &state.config.base_path;
         let encoded = channel.path_segments.join("/").replace('#', "%23");
         let date = latest_date(channel);
-        return Redirect::temporary(&format!("/{encoded}/{date}")).into_response();
+        return Redirect::temporary(&format!("{bp}/{encoded}/{date}")).into_response();
     }
 
     (StatusCode::NOT_FOUND, "not found").into_response()
@@ -225,12 +227,13 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
         next_date: next,
         is_today,
         ai_enabled: state.config.ai.is_some(),
+        base_path: &state.config.base_path,
     }).into_response()
 }
 
 fn serve_search(state: &AppState, channel: &crate::Channel, query: &str) -> Response {
     let results = search_channel(channel, query, state.config.search_limit);
-    templates::search_page(&state.config.title, &state.channels, channel, query, &results)
+    templates::search_page(&state.config.title, &state.channels, channel, query, &results, &state.config.base_path)
         .into_response()
 }
 
@@ -324,7 +327,7 @@ fn serve_ask_page(state: &AppState, channel: &crate::Channel) -> Response {
     if state.config.ai.is_none() {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    templates::ask_page(&state.config.title, &state.channels, channel).into_response()
+    templates::ask_page(&state.config.title, &state.channels, channel, &state.config.base_path).into_response()
 }
 
 async fn serve_ask_stream(
@@ -425,7 +428,7 @@ async fn serve_ask_output(
         let path = ai_config.output_dir.join(&md_name);
         return match std::fs::read_to_string(&path) {
             Ok(content) => {
-                templates::ask_output_page(&state.config.title, &md_name, &content).into_response()
+                templates::ask_output_page(&state.config.title, &md_name, &content, &state.config.base_path).into_response()
             }
             Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
         };

@@ -115,24 +115,24 @@ pub fn render_line(line: &LogLine) -> Markup {
     }
 }
 
-fn render_channel_tree(node: &ChannelNode, base_path: &str) -> Markup {
+fn render_channel_tree(node: &ChannelNode, parent_path: &str, base_path: &str) -> Markup {
     html! {
         ul {
             @for (name, child) in &node.children {
                 li {
-                    @let child_path = if base_path.is_empty() {
+                    @let child_path = if parent_path.is_empty() {
                         name.clone()
                     } else {
-                        format!("{base_path}/{name}")
+                        format!("{parent_path}/{name}")
                     };
                     @let encoded_path = child_path.replace('#', "%23");
                     @if let Some(channel) = &child.channel {
-                        a href=(format!("/{}/today", encoded_path)) { (&channel.name) }
+                        a href=(format!("{base_path}/{}/today", encoded_path)) { (&channel.name) }
                     } @else {
                         span.tree-label { (name) }
                     }
                     @if !child.children.is_empty() {
-                        (render_channel_tree(child, &child_path))
+                        (render_channel_tree(child, &child_path, base_path))
                     }
                 }
             }
@@ -140,7 +140,7 @@ fn render_channel_tree(node: &ChannelNode, base_path: &str) -> Markup {
     }
 }
 
-pub fn page(title: &str, tree: &ChannelNode, content: Markup) -> Markup {
+pub fn page(title: &str, tree: &ChannelNode, base_path: &str, content: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -148,12 +148,12 @@ pub fn page(title: &str, tree: &ChannelNode, content: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
-                link rel="stylesheet" href="/static/style.css";
+                link rel="stylesheet" href=(format!("{base_path}/static/style.css"));
             }
             body {
                 nav id="sidebar" {
                     h2 { (title) }
-                    (render_channel_tree(tree, ""))
+                    (render_channel_tree(tree, "", base_path))
                 }
                 main {
                     (content)
@@ -173,6 +173,7 @@ pub struct LogPageContext<'a> {
     pub next_date: Option<&'a str>,
     pub is_today: bool,
     pub ai_enabled: bool,
+    pub base_path: &'a str,
 }
 
 pub fn log_page(ctx: &LogPageContext) -> Markup {
@@ -185,13 +186,14 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
     let next_date = ctx.next_date;
     let is_today = ctx.is_today;
     let ai_enabled = ctx.ai_enabled;
+    let bp = ctx.base_path;
     let encoded = channel.path_segments.join("/").replace('#', "%23");
-    page(title, tree, html! {
+    page(title, tree, bp, html! {
         header id="log-header" {
             h1 { (&channel.name) " — " (date) }
             div.nav-links {
                 @if let Some(prev) = prev_date {
-                    a href=(format!("/{encoded}/{prev}")) { "← " (prev) }
+                    a href=(format!("{bp}/{encoded}/{prev}")) { "← " (prev) }
                 }
                 " "
                 input type="date" value=(date)
@@ -199,12 +201,12 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     ;
                 " "
                 @if let Some(next) = next_date {
-                    a href=(format!("/{encoded}/{next}")) { (next) " →" }
+                    a href=(format!("{bp}/{encoded}/{next}")) { (next) " →" }
                 }
                 " | "
-                a href=(format!("/{encoded}/today")) { "today" }
+                a href=(format!("{bp}/{encoded}/today")) { "today" }
                 " "
-                a href=(format!("/{encoded}/{date}/raw")) { "raw" }
+                a href=(format!("{bp}/{encoded}/{date}/raw")) { "raw" }
             }
             div.controls {
                 label {
@@ -212,13 +214,13 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     " show events"
                 }
                 " "
-                form.search-form action=(format!("/{encoded}/search")) method="get" {
+                form.search-form action=(format!("{bp}/{encoded}/search")) method="get" {
                     input type="text" name="q" placeholder="search…";
                     button type="submit" { "go" }
                 }
                 @if ai_enabled {
                     " "
-                    a href=(format!("/{encoded}/ask")) { "ask" }
+                    a href=(format!("{bp}/{encoded}/ask")) { "ask" }
                 }
             }
         }
@@ -229,24 +231,24 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
         }
         @if is_today {
             script {
-                (PreEscaped(r#"
-(function() {
+                (PreEscaped(format!(r#"
+(function() {{
     var log = document.getElementById('log');
-    var src = new EventSource('/' + log.dataset.channel + '/latest');
+    var src = new EventSource('{bp}/' + log.dataset.channel + '/latest');
     var atBottom = true;
-    window.addEventListener('scroll', function() {
+    window.addEventListener('scroll', function() {{
         atBottom = (window.innerHeight + window.scrollY) >= (document.body.offsetHeight - 50);
-    });
-    src.onmessage = function(e) {
+    }});
+    src.onmessage = function(e) {{
         log.insertAdjacentHTML('beforeend', e.data);
         if (atBottom) window.scrollTo(0, document.body.scrollHeight);
-    };
+    }};
     var cb = document.getElementById('toggle-events');
-    cb.addEventListener('change', function() {
+    cb.addEventListener('change', function() {{
         log.classList.toggle('hide-events', !cb.checked);
-    });
-})();
-"#))
+    }});
+}})();
+"#)))
             }
         } @else {
             script {
@@ -270,13 +272,14 @@ pub fn search_page(
     channel: &Channel,
     query: &str,
     results: &[(String, LogLine)],
+    base_path: &str,
 ) -> Markup {
     let encoded = channel.path_segments.join("/").replace('#', "%23");
-    page(title, tree, html! {
+    page(title, tree, base_path, html! {
         header id="log-header" {
             h1 { (&channel.name) " — search" }
             div.controls {
-                form.search-form action=(format!("/{encoded}/search")) method="get" {
+                form.search-form action=(format!("{base_path}/{encoded}/search")) method="get" {
                     input type="text" name="q" value=(query) placeholder="search…";
                     button type="submit" { "go" }
                 }
@@ -288,11 +291,11 @@ pub fn search_page(
             }
             @for (date, line) in results {
                 div.line {
-                    a.date href=(format!("/{encoded}/{date}#{}", line.time.to_anchor())) {
+                    a.date href=(format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor())) {
                         (date)
                     }
                     " "
-                    a.ts href=(format!("/{encoded}/{date}#{}", line.time.to_anchor())) {
+                    a.ts href=(format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor())) {
                         (line.time.to_hms())
                     }
                     " "
@@ -320,13 +323,13 @@ pub fn search_page(
     })
 }
 
-pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel) -> Markup {
+pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel, base_path: &str) -> Markup {
     let encoded = channel.path_segments.join("/").replace('#', "%23");
-    page(title, tree, html! {
+    page(title, tree, base_path, html! {
         header id="log-header" {
             h1 { (&channel.name) " — ask" }
             div.nav-links {
-                a href=(format!("/{encoded}/today")) { "back to logs" }
+                a href=(format!("{base_path}/{encoded}/today")) { "back to logs" }
             }
         }
         div id="ask-container" {
@@ -362,7 +365,7 @@ pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel) -> Markup {
         links.innerHTML = '';
         result.style.display = 'none';
         result.innerHTML = '';
-        var src = new EventSource('/{encoded}/ask/stream?q=' + encodeURIComponent(q));
+        var src = new EventSource('{base_path}/{encoded}/ask/stream?q=' + encodeURIComponent(q));
         src.addEventListener('display', function(e) {{
             var d = JSON.parse(e.data);
             var div = document.createElement('div');
@@ -428,7 +431,7 @@ pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel) -> Markup {
     })
 }
 
-pub fn ask_output_page(title: &str, md_filename: &str, content: &str) -> Markup {
+pub fn ask_output_page(title: &str, md_filename: &str, content: &str, base_path: &str) -> Markup {
     let mut html_output = String::new();
     let parser = pulldown_cmark::Parser::new(content);
     pulldown_cmark::html::push_html(&mut html_output, parser);
@@ -440,12 +443,12 @@ pub fn ask_output_page(title: &str, md_filename: &str, content: &str) -> Markup 
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — " (md_filename) }
-                link rel="stylesheet" href="/static/style.css";
+                link rel="stylesheet" href=(format!("{base_path}/static/style.css"));
             }
             body {
                 main style="margin-left:0; max-width:800px; margin:0 auto; padding:2em" {
                     div.nav-links {
-                        a href=(format!("/ask/output/{md_filename}")) { "raw" }
+                        a href=(format!("{base_path}/ask/output/{md_filename}")) { "raw" }
                     }
                     div.ask-output { (PreEscaped(html_output)) }
                 }

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use axum::Router;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore};
@@ -32,6 +33,8 @@ pub struct Config {
     #[serde(default = "default_search_limit")]
     pub search_limit: usize,
     pub logs_dirs: Vec<PathBuf>,
+    #[serde(default)]
+    pub base_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai: Option<AiConfig>,
 }
@@ -49,6 +52,7 @@ impl Default for Config {
             title: default_title(),
             search_limit: default_search_limit(),
             logs_dirs: vec![PathBuf::from("./logs")],
+            base_path: String::new(),
             ai: None,
         }
     }
@@ -98,7 +102,7 @@ pub struct AppState {
 async fn main() {
     let cli = Cli::parse();
 
-    let config: Config = if cli.config.exists() {
+    let mut config: Config = if cli.config.exists() {
         let content = std::fs::read_to_string(&cli.config).unwrap_or_else(|e| {
             eprintln!("cannot read config {:?}: {e}", cli.config);
             std::process::exit(1);
@@ -111,6 +115,7 @@ async fn main() {
         let config = Config::default();
         let mut yaml = serde_yaml::to_string(&config).unwrap();
         yaml.push_str(concat!(
+            "#base_path: /irc\n",
             "#ai:\n",
             "#  api_key: sk-ant-api03-...\n",
             "#  model: claude-haiku-4-5-20251001\n",
@@ -124,6 +129,14 @@ async fn main() {
         });
         eprintln!("created default config {:?}, edit and restart", cli.config);
         std::process::exit(0);
+    };
+
+    // Normalize base_path: strip trailing /, ensure leading / if non-empty
+    let bp = config.base_path.trim_matches('/');
+    config.base_path = if bp.is_empty() {
+        String::new()
+    } else {
+        format!("/{bp}")
     };
 
     let logs_dirs: Vec<PathBuf> = config.logs_dirs.iter().map(|d| {
@@ -160,7 +173,13 @@ async fn main() {
 
     tail::start_watcher(Arc::clone(&state));
 
-    let app = server::router().with_state(Arc::clone(&state));
+    let app = if state.config.base_path.is_empty() {
+        server::router().with_state(Arc::clone(&state))
+    } else {
+        Router::new()
+            .nest(&state.config.base_path, server::router())
+            .with_state(Arc::clone(&state))
+    };
     let listener = tokio::net::TcpListener::bind(&bind).await.unwrap_or_else(|e| {
         eprintln!("cannot bind {bind}: {e}");
         std::process::exit(1);

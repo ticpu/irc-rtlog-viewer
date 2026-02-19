@@ -431,7 +431,8 @@ fn execute_done(
         return format!("error writing file: {e}");
     }
 
-    let url = format!("/ask/output/{slug}.html");
+    let base_path = &state.config.base_path;
+    let url = format!("{base_path}/ask/output/{slug}.html");
 
     let _ = tx.send(SseEvent::Done {
         url: url.clone(),
