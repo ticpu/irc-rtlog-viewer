@@ -49,11 +49,16 @@ impl Default for Config {
 }
 
 #[derive(Debug, Clone)]
+pub struct ChannelDir {
+    pub path: PathBuf,
+    pub format: LogFormat,
+}
+
+#[derive(Debug, Clone)]
 pub struct Channel {
     pub name: String,
     pub path_segments: Vec<String>,
-    pub fs_path: PathBuf,
-    pub format: LogFormat,
+    pub dirs: Vec<ChannelDir>,
 }
 
 #[derive(Debug, Default)]
@@ -149,15 +154,12 @@ fn discover_channels(
     }
 
     if has_logs && !segments.is_empty() {
-        let leaf_name = segments.last().unwrap();
         let format = detect_channel_format(dir);
-        let channel = Channel {
-            name: leaf_name.clone(),
-            path_segments: segments.to_vec(),
-            fs_path: dir.to_path_buf(),
+        let channel_dir = ChannelDir {
+            path: dir.to_path_buf(),
             format,
         };
-        insert_channel(root, segments, channel);
+        insert_channel(root, segments, channel_dir);
     }
 
     // If any sibling subdir starts with #, only recurse into #-prefixed dirs
@@ -192,10 +194,18 @@ fn detect_channel_format(dir: &Path) -> LogFormat {
     LogFormat::Iso8601
 }
 
-fn insert_channel(root: &mut ChannelNode, segments: &[String], channel: Channel) {
+fn insert_channel(root: &mut ChannelNode, segments: &[String], dir: ChannelDir) {
     let mut node = root;
     for seg in segments {
         node = node.children.entry(seg.clone()).or_default();
     }
-    node.channel = Some(channel);
+    if let Some(channel) = &mut node.channel {
+        channel.dirs.push(dir);
+    } else {
+        node.channel = Some(Channel {
+            name: segments.last().unwrap().clone(),
+            path_segments: segments.to_vec(),
+            dirs: vec![dir],
+        });
+    }
 }

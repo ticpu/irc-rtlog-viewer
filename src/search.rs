@@ -1,29 +1,20 @@
-use std::path::Path;
-
-use crate::parser::{LogFormat, LogLine, parse_line};
-use crate::server::read_log_file;
+use crate::Channel;
+use crate::parser::{LogLine, parse_line};
+use crate::server::{channel_dates, resolve_log_path, read_log_file};
 
 pub fn search_channel(
-    dir: &Path,
-    format: LogFormat,
+    channel: &Channel,
     query: &str,
     limit: usize,
 ) -> Vec<(String, LogLine)> {
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
-    let mut dates = list_dates(dir);
-    dates.sort_unstable();
+    let mut dates = channel_dates(channel);
     dates.reverse();
 
     for date in dates {
-        let path = dir.join(format!("{date}.log"));
-        let zst_path = dir.join(format!("{date}.log.zst"));
-        let file_path = if path.exists() { &path } else { &zst_path };
-
-        let content = match read_log_file(file_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let Some((path, format)) = resolve_log_path(channel, &date) else { continue };
+        let Ok(content) = read_log_file(&path) else { continue };
 
         for raw_line in content.lines() {
             if raw_line.to_lowercase().contains(&query_lower) {
@@ -38,23 +29,4 @@ pub fn search_channel(
     }
 
     results
-}
-
-fn list_dates(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            let date = name.strip_suffix(".log")
-                .or_else(|| name.strip_suffix(".log.zst"))?;
-            if date.len() == 10 {
-                Some(date.to_string())
-            } else {
-                None
-            }
-        })
-        .collect()
 }

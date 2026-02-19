@@ -100,23 +100,26 @@ fn resolve_channel(path: &PathBuf, state: &AppState) -> Option<(String, LogForma
     for logs_dir in &state.logs_dirs {
         if let Ok(rel) = parent.strip_prefix(logs_dir) {
             let segments: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
-            if let Some(result) = find_channel_in_tree(&state.channels, &segments, 0) {
-                return Some(result);
+            if let Some(channel) = find_channel_in_tree(&state.channels, &segments, 0) {
+                let key = channel.path_segments.join("/");
+                let format = channel.dirs.iter()
+                    .find(|d| parent.starts_with(&d.path))
+                    .map(|d| d.format)
+                    .unwrap_or(channel.dirs[0].format);
+                return Some((key, format));
             }
         }
     }
     None
 }
 
-fn find_channel_in_tree(
-    node: &crate::ChannelNode,
+fn find_channel_in_tree<'a>(
+    node: &'a crate::ChannelNode,
     segments: &[String],
     depth: usize,
-) -> Option<(String, LogFormat)> {
+) -> Option<&'a crate::Channel> {
     if depth >= segments.len() {
-        let ch = node.channel.as_ref()?;
-        let key = ch.path_segments.join("/");
-        return Some((key, ch.format));
+        return node.channel.as_ref();
     }
 
     let child = node.children.get(&segments[depth])?;

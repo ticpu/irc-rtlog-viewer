@@ -14,7 +14,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
-use crate::parser::parse_line;
+use crate::parser::{LogFormat, parse_line};
 use crate::search::search_channel;
 use crate::templates;
 
@@ -76,7 +76,7 @@ async fn wildcard(
             return match action {
                 "today" => {
                     let encoded = channel.path_segments.join("/").replace('#', "%23");
-                    let date = latest_date(&channel.fs_path);
+                    let date = latest_date(&channel);
                     Redirect::temporary(&format!("/{encoded}/{date}")).into_response()
                 }
                 "latest" => serve_sse(state, &channel).await.into_response(),
@@ -99,7 +99,7 @@ async fn wildcard(
     // Maybe bare channel path → redirect to latest date
     if let Some(channel) = find_channel(&state.channels, &segments) {
         let encoded = channel.path_segments.join("/").replace('#', "%23");
-        let date = latest_date(&channel.fs_path);
+        let date = latest_date(channel);
         return Redirect::temporary(&format!("/{encoded}/{date}")).into_response();
     }
 
@@ -177,20 +177,25 @@ fn find_channel<'a>(
 }
 
 fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Response {
-    let path = resolve_log_path(&channel.fs_path, date);
-    let content = match path.and_then(|p| read_log_file(&p).ok()) {
-        Some(c) => c,
+    let (path, format) = match resolve_log_path(channel, date) {
+        Some(r) => r,
         None => {
             return (StatusCode::NOT_FOUND, format!("no log for {date}")).into_response();
+        }
+    };
+    let content = match read_log_file(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("read error: {e}")).into_response();
         }
     };
 
     let lines: Vec<_> = content
         .lines()
-        .filter_map(|l| parse_line(l, channel.format))
+        .filter_map(|l| parse_line(l, format))
         .collect();
 
-    let dates = list_dates(&channel.fs_path);
+    let dates = channel_dates(channel);
     let idx = dates.iter().position(|d| d == date);
     let prev = idx.and_then(|i| if i > 0 { dates.get(i - 1) } else { None }).map(|s| s.as_str());
     let next = idx.and_then(|i| dates.get(i + 1)).map(|s| s.as_str());
@@ -209,18 +214,20 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
 }
 
 fn serve_search(state: &AppState, channel: &crate::Channel, query: &str) -> Response {
-    let results = search_channel(&channel.fs_path, channel.format, query, state.config.search_limit);
+    let results = search_channel(channel, query, state.config.search_limit);
     templates::search_page(&state.config.title, &state.channels, channel, query, &results)
         .into_response()
 }
 
 async fn serve_raw(channel: &crate::Channel, date: &str) -> Response {
-    let path = resolve_log_path(&channel.fs_path, date);
-    match path.and_then(|p| read_log_file(&p).ok()) {
-        Some(content) => {
+    let Some((path, _)) = resolve_log_path(channel, date) else {
+        return (StatusCode::NOT_FOUND, format!("no log for {date}")).into_response();
+    };
+    match read_log_file(&path) {
+        Ok(content) => {
             ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], content).into_response()
         }
-        None => (StatusCode::NOT_FOUND, format!("no log for {date}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("read error: {e}")).into_response(),
     }
 }
 
@@ -261,40 +268,39 @@ pub fn read_log_file(path: &Path) -> io::Result<String> {
     Ok(content)
 }
 
-pub fn resolve_log_path(dir: &Path, date: &str) -> Option<std::path::PathBuf> {
-    let plain = dir.join(format!("{date}.log"));
-    if plain.exists() {
-        return Some(plain);
-    }
-    let zst = dir.join(format!("{date}.log.zst"));
-    if zst.exists() {
-        return Some(zst);
+pub fn resolve_log_path(channel: &crate::Channel, date: &str) -> Option<(std::path::PathBuf, LogFormat)> {
+    for dir in &channel.dirs {
+        let plain = dir.path.join(format!("{date}.log"));
+        if plain.exists() {
+            return Some((plain, dir.format));
+        }
+        let zst = dir.path.join(format!("{date}.log.zst"));
+        if zst.exists() {
+            return Some((zst, dir.format));
+        }
     }
     None
 }
 
-fn latest_date(dir: &Path) -> String {
-    let dates = list_dates(dir);
+fn latest_date(channel: &crate::Channel) -> String {
+    let dates = channel_dates(channel);
     dates.last().cloned().unwrap_or_else(today_date)
 }
 
-fn list_dates(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut dates: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
+pub fn channel_dates(channel: &crate::Channel) -> Vec<String> {
+    let mut dates = std::collections::BTreeSet::new();
+    for dir in &channel.dirs {
+        let Ok(entries) = std::fs::read_dir(&dir.path) else { continue };
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else { continue };
             let date = name.strip_suffix(".log")
-                .or_else(|| name.strip_suffix(".log.zst"))?;
-            if date.len() == 10 {
-                Some(date.to_string())
-            } else {
-                None
+                .or_else(|| name.strip_suffix(".log.zst"));
+            if let Some(d) = date {
+                if d.len() == 10 {
+                    dates.insert(d.to_string());
+                }
             }
-        })
-        .collect();
-    dates.sort_unstable();
-    dates
+        }
+    }
+    dates.into_iter().collect()
 }
