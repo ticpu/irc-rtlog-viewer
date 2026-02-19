@@ -113,7 +113,13 @@ fn is_date_raw(last: &str, len: usize) -> bool {
 }
 
 fn looks_like_date(s: &str) -> bool {
-    s.len() == 10 && s.as_bytes().get(4) == Some(&b'-') && s.as_bytes().get(7) == Some(&b'-')
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[8..10].iter().all(u8::is_ascii_digit)
 }
 
 fn today_date() -> String {

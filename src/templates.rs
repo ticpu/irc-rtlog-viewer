@@ -216,31 +216,31 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                 }
             }
         }
-        div id="log" {
+        div id="log" data-channel=(&encoded) {
             @for line in lines {
                 (render_line(line))
             }
         }
         @if is_today {
             script {
-                (PreEscaped(format!(r#"
-(function() {{
+                (PreEscaped(r#"
+(function() {
     var log = document.getElementById('log');
-    var src = new EventSource('/{encoded}/latest');
+    var src = new EventSource('/' + log.dataset.channel + '/latest');
     var atBottom = true;
-    window.addEventListener('scroll', function() {{
+    window.addEventListener('scroll', function() {
         atBottom = (window.innerHeight + window.scrollY) >= (document.body.offsetHeight - 50);
-    }});
-    src.onmessage = function(e) {{
+    });
+    src.onmessage = function(e) {
         log.insertAdjacentHTML('beforeend', e.data);
         if (atBottom) window.scrollTo(0, document.body.scrollHeight);
-    }};
+    };
     var cb = document.getElementById('toggle-events');
-    cb.addEventListener('change', function() {{
+    cb.addEventListener('change', function() {
         log.classList.toggle('hide-events', !cb.checked);
-    }});
-}})();
-"#)))
+    });
+})();
+"#))
             }
         } @else {
             script {
