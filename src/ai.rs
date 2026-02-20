@@ -424,8 +424,12 @@ fn execute_done(
     };
 
     let ai_config = state.config.ai.as_ref().unwrap();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let slug = slugify(title);
-    let filename = format!("{slug}.md");
+    let filename = format!("{ts}-{slug}.md");
     let path = ai_config.output_dir.join(&filename);
 
     if let Err(e) = std::fs::write(&path, output_buf) {
@@ -434,7 +438,7 @@ fn execute_done(
     }
 
     let base_path = &state.config.base_path;
-    let url = format!("{base_path}/ask/output/{slug}.html");
+    let url = format!("{base_path}/ask/output/{ts}-{slug}.html");
 
     let _ = tx.send(SseEvent::Done {
         url: url.clone(),
