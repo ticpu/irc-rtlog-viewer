@@ -20,6 +20,10 @@ use crate::templates;
 
 static CSS: &str = include_str!("../static/style.css");
 
+fn cache_control(value: &str) -> (header::HeaderName, &str) {
+    (header::CACHE_CONTROL, value)
+}
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(index))
@@ -29,14 +33,22 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Response {
-    templates::page(&state.config.title, &state.channels, &state.config.base_path, maud::html! {
+    let mut resp = templates::page(&state.config.title, &state.channels, &state.config.base_path, maud::html! {
         h1 { (&state.config.title) }
         p { "Select a channel from the sidebar." }
-    }).into_response()
+    }).into_response();
+    resp.headers_mut().insert(header::CACHE_CONTROL, "private, no-cache".parse().unwrap());
+    resp
 }
 
 async fn serve_css() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css")], CSS)
+    (
+        [
+            (header::CONTENT_TYPE, "text/css"),
+            cache_control("public, max-age=86400, s-maxage=604800"),
+        ],
+        CSS,
+    )
 }
 
 #[derive(Deserialize)]
@@ -217,7 +229,7 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
     let next = idx.and_then(|i| dates.get(i + 1)).map(|s| s.as_str());
     let is_today = date == today_date();
 
-    templates::log_page(&templates::LogPageContext {
+    let mut resp = templates::log_page(&templates::LogPageContext {
         title: &state.config.title,
         tree: &state.channels,
         channel,
@@ -228,22 +240,43 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
         is_today,
         ai_enabled: state.config.ai.is_some(),
         base_path: &state.config.base_path,
-    }).into_response()
+    }).into_response();
+    let cc = if is_today {
+        "public, max-age=30, s-maxage=120"
+    } else {
+        "public, max-age=3600, s-maxage=86400"
+    };
+    resp.headers_mut().insert(header::CACHE_CONTROL, cc.parse().unwrap());
+    resp
 }
 
 fn serve_search(state: &AppState, channel: &crate::Channel, query: &str) -> Response {
     let results = search_channel(channel, query, state.config.search_limit);
-    templates::search_page(&state.config.title, &state.channels, channel, query, &results, &state.config.base_path)
-        .into_response()
+    let mut resp = templates::search_page(&state.config.title, &state.channels, channel, query, &results, &state.config.base_path)
+        .into_response();
+    resp.headers_mut().insert(header::CACHE_CONTROL, "private, no-cache".parse().unwrap());
+    resp
 }
 
 async fn serve_raw(channel: &crate::Channel, date: &str) -> Response {
     let Some((path, _)) = resolve_log_path(channel, date) else {
         return (StatusCode::NOT_FOUND, format!("no log for {date}")).into_response();
     };
+    let cc = if date == today_date() {
+        "public, max-age=60, s-maxage=300"
+    } else {
+        "public, max-age=86400, s-maxage=604800"
+    };
     match read_log_file(&path) {
         Ok(content) => {
-            ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], content).into_response()
+            (
+                [
+                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                    cache_control(cc),
+                ],
+                content,
+            )
+                .into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("read error: {e}")).into_response(),
     }
@@ -327,7 +360,9 @@ fn serve_ask_page(state: &AppState, channel: &crate::Channel) -> Response {
     if state.config.ai.is_none() {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    templates::ask_page(&state.config.title, &state.channels, channel, &state.config.base_path).into_response()
+    let mut resp = templates::ask_page(&state.config.title, &state.channels, channel, &state.config.base_path).into_response();
+    resp.headers_mut().insert(header::CACHE_CONTROL, "private, no-cache".parse().unwrap());
+    resp
 }
 
 async fn serve_ask_stream(
@@ -417,7 +452,14 @@ async fn serve_ask_output(
         let path = ai_config.output_dir.join(&filename);
         return match std::fs::read_to_string(&path) {
             Ok(content) => {
-                ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], content).into_response()
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                        cache_control("public, max-age=3600, s-maxage=86400"),
+                    ],
+                    content,
+                )
+                    .into_response()
             }
             Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
         };
@@ -428,7 +470,9 @@ async fn serve_ask_output(
         let path = ai_config.output_dir.join(&md_name);
         return match std::fs::read_to_string(&path) {
             Ok(content) => {
-                templates::ask_output_page(&state.config.title, &md_name, &content, &state.config.base_path).into_response()
+                let mut resp = templates::ask_output_page(&state.config.title, &md_name, &content, &state.config.base_path).into_response();
+                resp.headers_mut().insert(header::CACHE_CONTROL, "public, max-age=3600, s-maxage=86400".parse().unwrap());
+                resp
             }
             Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
         };
