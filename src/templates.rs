@@ -151,11 +151,12 @@ pub fn page(title: &str, tree: &ChannelNode, base_path: &str, content: Markup) -
                 link rel="stylesheet" href=(format!("{base_path}/static/style.css"));
             }
             body {
+                button id="sidebar-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')" { "☰" }
                 nav id="sidebar" {
                     h2 { (title) }
                     (render_channel_tree(tree, "", base_path))
                 }
-                main {
+                main onclick="document.getElementById('sidebar').classList.remove('open')" {
                     (content)
                 }
             }
@@ -446,7 +447,7 @@ pub fn ask_output_page(title: &str, md_filename: &str, content: &str, base_path:
                 link rel="stylesheet" href=(format!("{base_path}/static/style.css"));
             }
             body {
-                main style="margin-left:0; max-width:800px; margin:0 auto; padding:2em" {
+                main style="margin-left:0; max-width:800px; margin:0 auto; padding:1em; overflow-wrap:break-word; min-width:0; width:100%" {
                     div.nav-links {
                         a href=(format!("{base_path}/ask/output/{md_filename}")) { "raw" }
                     }

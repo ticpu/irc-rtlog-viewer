@@ -9,7 +9,8 @@
     --font: "Iosevka", "Fira Code", "Cascadia Code", monospace;
 }
 
-* { margin: 0; padding: 0; box-sizing: border-box; }
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+html { overflow-x: hidden; }
 
 body {
     font-family: var(--font);
@@ -211,24 +212,68 @@ main {
 .ask-expand { color: var(--accent); font-size: 0.9em; cursor: pointer; text-decoration: none; }
 .ask-expand:hover { text-decoration: underline; }
 .ask-error { color: #ff6b6b; }
-.ask-output h1, .ask-output h2, .ask-output h3 { margin: 0.8em 0 0.4em; }
+.ask-output { overflow-wrap: break-word; word-break: break-word; }
+.ask-output h1 { font-size: 1.4em; margin: 0.8em 0 0.4em; }
+.ask-output h2 { font-size: 1.2em; margin: 0.8em 0 0.4em; }
+.ask-output h3 { font-size: 1.1em; margin: 0.8em 0 0.4em; }
 .ask-output p { margin: 0.4em 0; }
-.ask-output pre { background: var(--bg-alt); padding: 0.5em; overflow-x: auto; }
+.ask-output pre { background: var(--bg-alt); padding: 0.5em; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+.ask-output code { word-break: break-all; }
+.ask-output blockquote { border-left: 2px solid var(--border); padding-left: 0.5em; margin: 0.4em 0; }
 .ask-output a { color: var(--accent); }
+.ask-output ul, .ask-output ol { padding-left: 1.5em; }
+.ask-output li { margin: 0.2em 0; }
+
+#sidebar-toggle {
+    display: none;
+    background: var(--bg-alt);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 0.3em 0.6em;
+    font-family: var(--font);
+    font-size: 1em;
+    cursor: pointer;
+    position: fixed;
+    top: 0.4em;
+    left: 0.4em;
+    z-index: 20;
+}
+
+#sidebar-toggle:hover { border-color: var(--accent); }
 
 @media (max-width: 700px) {
+    #sidebar-toggle { display: block; }
+
     #sidebar {
-        position: static;
-        width: 100%;
+        position: fixed;
+        z-index: 10;
+        width: 75vw;
+        max-width: 280px;
         min-width: 0;
-        border-right: none;
-        border-bottom: 1px solid var(--border);
+        border-right: 1px solid var(--border);
+        transform: translateX(-100%);
+        transition: transform 0.2s ease;
     }
+
+    #sidebar.open { transform: translateX(0); }
 
     body { flex-direction: column; }
 
     main {
         margin-left: 0;
         padding: 0.8em;
+        padding-top: 2.5em;
     }
+
+    #log-header h1 { font-size: 1em; }
+
+    .nav-links { gap: 0.3em; }
+
+    .search-form input[type="text"] { width: 8em; }
+
+    .controls { gap: 0.5em; }
+
+    #ask-form { flex-direction: column; }
+    #ask-form input[type="text"] { width: 100%; }
+    #ask-result { height: 50vh; }
 }
