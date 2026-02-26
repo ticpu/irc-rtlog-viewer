@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::AppState;
 use crate::Channel;
+use crate::parser::parse_line;
 use crate::server::{channel_dates, resolve_log_path, read_log_file};
 
 pub enum SseEvent {
@@ -112,6 +113,10 @@ fn build_tool_definitions() -> Vec<Value> {
                     "n": {
                         "type": "boolean",
                         "description": "Count-only mode: return match count per date instead of lines"
+                    },
+                    "events": {
+                        "type": "boolean",
+                        "description": "Include join/part/quit/nick-change lines (default: false, only messages and actions are searched)"
                     },
                     "c": {
                         "type": "integer",
@@ -242,6 +247,7 @@ fn execute_search(input: &Value, state: &AppState) -> String {
     };
 
     let count_only = input["n"].as_bool().unwrap_or(false);
+    let include_events = input["events"].as_bool().unwrap_or(false);
     let max_results = input["c"].as_u64().unwrap_or(50) as usize;
     let context_after = input["C"].as_u64().unwrap_or(0).max(input["A"].as_u64().unwrap_or(0)) as usize;
     let context_before = input["C"].as_u64().unwrap_or(0).max(input["B"].as_u64().unwrap_or(0)) as usize;
@@ -278,7 +284,7 @@ fn execute_search(input: &Value, state: &AppState) -> String {
         }
         dates_scanned += 1;
 
-        let Some((path, _)) = resolve_log_path(channel, date) else { continue };
+        let Some((path, format)) = resolve_log_path(channel, date) else { continue };
         let Ok(content) = read_log_file(&path) else { continue };
         let all_lines: Vec<&str> = content.lines().collect();
 
@@ -287,6 +293,13 @@ fn execute_search(input: &Value, state: &AppState) -> String {
 
         for (i, line) in all_lines.iter().enumerate() {
             if re.is_match(line) {
+                if !include_events {
+                    if let Some(parsed) = parse_line(line, format) {
+                        if parsed.is_event() {
+                            continue;
+                        }
+                    }
+                }
                 date_matches += 1;
                 if !count_only {
                     let start = i.saturating_sub(context_before);
@@ -311,6 +324,13 @@ fn execute_search(input: &Value, state: &AppState) -> String {
         out.push_str(&format!("--- {channel_path} {date} ({date_matches} matches) ---\n"));
         let mut prev_line: Option<usize> = None;
         for j in &emitted_lines {
+            if !include_events {
+                if let Some(parsed) = parse_line(all_lines[*j], format) {
+                    if parsed.is_event() {
+                        continue;
+                    }
+                }
+            }
             if let Some(p) = prev_line {
                 if *j > p + 1 {
                     out.push_str("--\n");
