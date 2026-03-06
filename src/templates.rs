@@ -372,21 +372,21 @@ pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel, base_path: &
             var div = document.createElement('div');
             div.className = 'ask-display';
             div.textContent = d.text;
-            log.appendChild(div);
+            log.prepend(div);
         }});
         src.addEventListener('tool_call', function(e) {{
             var d = JSON.parse(e.data);
             var div = document.createElement('div');
             div.className = 'ask-tool';
             div.textContent = '> ' + d.name + '(' + d.input + ')';
-            log.appendChild(div);
+            log.prepend(div);
         }});
         src.addEventListener('tool_result', function(e) {{
             var d = JSON.parse(e.data);
             var pre = document.createElement('pre');
             pre.className = 'ask-result-preview';
             pre.textContent = d.output;
-            log.appendChild(pre);
+            log.prepend(pre);
             requestAnimationFrame(function() {{
                 if (pre.scrollHeight > pre.clientHeight) {{
                     var btn = document.createElement('a');
@@ -398,15 +398,14 @@ pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel, base_path: &
                         var expanded = pre.classList.toggle('expanded');
                         btn.textContent = expanded ? 'collapse' : 'expand';
                     }};
-                    pre.after(btn);
+                    pre.before(btn);
                 }}
             }});
         }});
         src.addEventListener('done', function(e) {{
             var d = JSON.parse(e.data);
-            var mdUrl = d.url.replace(/\.html$/, '.md');
             links.style.display = 'block';
-            links.innerHTML = '<a href="' + mdUrl + '">' + mdUrl + '</a>';
+            links.innerHTML = '<a href="' + d.url + '">' + d.url + '</a>';
             result.src = d.url;
             result.style.display = 'block';
             src.close();
@@ -417,7 +416,7 @@ pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel, base_path: &
             var div = document.createElement('div');
             div.className = 'ask-error';
             div.textContent = d.error;
-            log.appendChild(div);
+            log.prepend(div);
             src.close();
             setBusy(false);
         }});
