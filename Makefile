@@ -1,5 +1,5 @@
 BINARY := irc-log-viewer
-DEPLOY_HOST := root@openwrt
+DEPLOY_HOST := root@glrouter
 REMOTE_DIR := /usr/local/bin
 
 CROSS_TARGET := aarch64-unknown-linux-musl
@@ -27,7 +27,14 @@ cross:
 
 deploy: cross
 	scp openwrt/irc-log-viewer.init $(DEPLOY_HOST):/etc/init.d/irc-log-viewer
-	-ssh $(DEPLOY_HOST) 'chmod +x /etc/init.d/irc-log-viewer && /etc/init.d/irc-log-viewer stop'
+	ssh $(DEPLOY_HOST) 'chmod +x /etc/init.d/irc-log-viewer; \
+		/etc/init.d/irc-log-viewer stop || true; \
+		for i in $$(seq 1 15); do \
+			ps | grep -v grep | grep -q "$(REMOTE_DIR)/$(BINARY)" || exit 0; \
+			sleep 1; \
+		done; \
+		echo "$(BINARY) still running after stop, refusing to overwrite" >&2; \
+		exit 1'
 	scp target/$(CROSS_TARGET)/release/$(BINARY) $(DEPLOY_HOST):$(REMOTE_DIR)/$(BINARY)
 	ssh $(DEPLOY_HOST) /etc/init.d/irc-log-viewer start
 
