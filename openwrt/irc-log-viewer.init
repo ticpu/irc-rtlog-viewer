@@ -14,7 +14,6 @@ start_service() {
 	procd_set_param stderr 1
 	procd_set_param stdout 1
 	procd_set_param user znc
-	procd_set_param signal SIGKILL
 	procd_set_param nice 5
 	procd_set_param limits core="0" as="262144000"
 
@@ -32,9 +31,8 @@ start_service() {
 	procd_close_instance
 }
 
-stop_service() {
-	killall -KILL irc-log-viewer
-}
+# No stop_service(): it runs before procd marks the instance halted, so killing
+# the process there looks like a crash and respawn restarts it.
 
 service_triggers() {
 	procd_add_reload_trigger irc-log-viewer

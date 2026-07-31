@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::sync::broadcast;
 
@@ -191,7 +192,22 @@ async fn main() {
         std::process::exit(1);
     });
     eprintln!("listening on {bind}");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+// Under ujail the process is PID 1 in its own namespace, where the kernel drops
+// signals from outside unless a handler is installed. Without this, SIGTERM is
+// discarded and procd can only stop us by waiting out ujail's SIGKILL timer.
+async fn shutdown_signal() {
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => eprintln!("SIGTERM, shutting down"),
+        _ = int.recv() => eprintln!("SIGINT, shutting down"),
+    }
 }
 
 fn discover_channels(

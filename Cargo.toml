@@ -12,7 +12,7 @@ maud = { version = "0.27", features = ["axum"] }
 notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt", "macros", "fs", "sync", "net"] }
+tokio = { version = "1", features = ["rt", "macros", "fs", "sync", "net", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 regex = "1"
