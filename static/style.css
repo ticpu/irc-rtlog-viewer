@@ -185,6 +185,7 @@ main {
 }
 
 #ask-container { max-width: 800px; }
+.ask-intro { color: var(--fg-dim); margin: 0 0 0.8em; }
 #ask-form { display: flex; gap: 0.3em; margin-bottom: 1em; }
 #ask-form input[type="text"] {
     flex: 1;

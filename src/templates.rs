@@ -240,7 +240,8 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     }
                     @if ai_enabled {
                         " "
-                        a href=(format!("{bp}/{encoded}/ask")) { "ask" }
+                        a href=(format!("{bp}/{encoded}/ask"))
+                            title="Ask an AI to search the logs and compile an answer" { "ask AI" }
                     }
                 }
             }
@@ -352,7 +353,13 @@ pub fn search_page(
     )
 }
 
-pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel, base_path: &str) -> Markup {
+pub fn ask_page(
+    title: &str,
+    tree: &ChannelNode,
+    channel: &Channel,
+    base_path: &str,
+    max_query_len: usize,
+) -> Markup {
     let encoded = channel
         .path_segments
         .join("/")
@@ -363,15 +370,22 @@ pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel, base_path: &
         base_path,
         html! {
             header id="log-header" {
-                h1 { (&channel.name) " — ask" }
+                h1 { (&channel.name) " — ask AI" }
                 div.nav-links {
                     a href=(format!("{base_path}/{encoded}/today")) { "back to logs" }
                 }
             }
             div id="ask-container" {
+                p.ask-intro {
+                    "Ask a question in plain language and an AI will search the logs and
+                     compile an answer. It searches " strong { (&channel.name) } " by
+                     default, and can search other channels if you name them in your question."
+                }
                 form id="ask-form" {
-                    input type="text" name="q" placeholder="ask about logs…" autocomplete="off";
-                    button type="submit" { "ask" }
+                    input type="text" name="q"
+                        placeholder="e.g. what was decided about the router config?"
+                        maxlength=(max_query_len) autocomplete="off";
+                    button type="submit" { "ask AI" }
                 }
                 div id="ask-links" style="display:none" {}
                 iframe id="ask-result" style="display:none" {}
@@ -389,7 +403,7 @@ pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel, base_path: &
     function setBusy(busy) {{
         btn.disabled = busy;
         input.disabled = busy;
-        btn.textContent = busy ? 'working…' : 'ask';
+        btn.textContent = busy ? 'working…' : 'ask AI';
     }}
     form.onsubmit = function(e) {{
         e.preventDefault();

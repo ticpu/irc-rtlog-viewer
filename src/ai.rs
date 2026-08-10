@@ -37,6 +37,7 @@ Workflow:
 5. Use done to save and finish -- you MUST always call done to produce a result
 
 Rules:
+- The user message names the channel to search by default; search other channels only when the question calls for it
 - Only retrieve and summarize IRC log content
 - Summaries must be grounded in the log data -- no speculation
 - If the query is unrelated to IRC log search, call abort immediately
@@ -570,7 +571,7 @@ fn execute_abort(tx: &mpsc::UnboundedSender<SseEvent>) -> String {
 
 pub async fn run_ai_session(
     query: String,
-    _channel: Channel,
+    channel: Channel,
     state: Arc<AppState>,
     tx: mpsc::UnboundedSender<SseEvent>,
 ) {
@@ -603,9 +604,20 @@ pub async fn run_ai_session(
         .api_key
         .clone();
 
+    // Scope goes in the user message, not the system prompt: system_prompt is
+    // user-overridable, and the tools+system prefix is cached.
+    let channel_path = channel
+        .path_segments
+        .join("/");
+    // Newlines stripped so a query cannot forge its own scope line below.
+    let query = query.replace(['\n', '\r'], " ");
     let mut messages: Vec<Value> = vec![json!({
         "role": "user",
-        "content": query,
+        "content": format!(
+            "Default channel to search: {channel_path}\n\
+             Search other channels only if the question below names them.\n\n\
+             Question:\n{query}"
+        ),
     })];
 
     // Put cache_control on the last tool so tools+system prefix can be cached.

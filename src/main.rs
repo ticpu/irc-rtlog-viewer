@@ -58,6 +58,9 @@ fn default_ai_max_concurrent() -> usize {
 fn default_ai_max_tool_calls() -> usize {
     100
 }
+fn default_ai_max_query_len() -> usize {
+    500
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -82,6 +85,8 @@ pub struct AiConfig {
     pub max_concurrent: usize,
     #[serde(default = "default_ai_max_tool_calls")]
     pub max_tool_calls: usize,
+    #[serde(default = "default_ai_max_query_len")]
+    pub max_query_len: usize,
     #[serde(default)]
     pub system_prompt: Option<String>,
 }
@@ -141,6 +146,7 @@ async fn main() {
             "#  output_dir: /var/lib/irc-logs/ask\n",
             "#  max_concurrent: 1\n",
             "#  max_tool_calls: 100\n",
+            "#  max_query_len: 500\n",
             "#  system_prompt: |\n",
             "#    Custom system prompt text here.\n",
             "#    The channel list is always appended automatically.\n",

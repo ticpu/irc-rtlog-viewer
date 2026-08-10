@@ -489,13 +489,12 @@ pub fn channel_dates(channel: &crate::Channel) -> Vec<String> {
 }
 
 fn serve_ask_page(state: &AppState, channel: &crate::Channel) -> Response {
-    if state
+    let Some(ai_config) = &state
         .config
         .ai
-        .is_none()
-    {
+    else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
+    };
     let mut resp = templates::ask_page(
         &state
             .config
@@ -505,6 +504,7 @@ fn serve_ask_page(state: &AppState, channel: &crate::Channel) -> Response {
         &state
             .config
             .base_path,
+        ai_config.max_query_len,
     )
     .into_response();
     resp.headers_mut()
@@ -529,6 +529,25 @@ async fn serve_ask_stream(state: Arc<AppState>, channel: crate::Channel, query: 
     let query = query.to_string();
     if query.is_empty() {
         return (StatusCode::BAD_REQUEST, "query is required").into_response();
+    }
+
+    // chars, not bytes, so the limit matches what the input's maxlength counts
+    let max_query_len = state
+        .config
+        .ai
+        .as_ref()
+        .unwrap()
+        .max_query_len;
+    if query
+        .chars()
+        .count()
+        > max_query_len
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("query too long, limit is {max_query_len} characters"),
+        )
+            .into_response();
     }
 
     let semaphore = state
