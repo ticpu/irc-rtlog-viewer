@@ -6,8 +6,8 @@ use axum::Router;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{RwLock, Semaphore};
 use tokio::sync::broadcast;
+use tokio::sync::{RwLock, Semaphore};
 
 mod ai;
 mod parser;
@@ -40,12 +40,24 @@ pub struct Config {
     pub ai: Option<AiConfig>,
 }
 
-fn default_bind() -> String { "0.0.0.0:8080".into() }
-fn default_title() -> String { "IRC Logs".into() }
-fn default_search_limit() -> usize { 10000 }
-fn default_ai_model() -> String { "claude-haiku-4-5-20251001".into() }
-fn default_ai_max_concurrent() -> usize { 1 }
-fn default_ai_max_tool_calls() -> usize { 100 }
+fn default_bind() -> String {
+    "0.0.0.0:8080".into()
+}
+fn default_title() -> String {
+    "IRC Logs".into()
+}
+fn default_search_limit() -> usize {
+    10000
+}
+fn default_ai_model() -> String {
+    "claude-haiku-4-5-20251001".into()
+}
+fn default_ai_max_concurrent() -> usize {
+    1
+}
+fn default_ai_max_tool_calls() -> usize {
+    100
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -106,7 +118,10 @@ pub struct AppState {
 async fn main() {
     let cli = Cli::parse();
 
-    let mut config: Config = if cli.config.exists() {
+    let mut config: Config = if cli
+        .config
+        .exists()
+    {
         let content = std::fs::read_to_string(&cli.config).unwrap_or_else(|e| {
             eprintln!("cannot read config {:?}: {e}", cli.config);
             std::process::exit(1);
@@ -139,29 +154,40 @@ async fn main() {
     };
 
     // Normalize base_path: strip trailing /, ensure leading / if non-empty
-    let bp = config.base_path.trim_matches('/');
+    let bp = config
+        .base_path
+        .trim_matches('/');
     config.base_path = if bp.is_empty() {
         String::new()
     } else {
         format!("/{bp}")
     };
 
-    let logs_dirs: Vec<PathBuf> = config.logs_dirs.iter().map(|d| {
-        std::fs::canonicalize(d).unwrap_or_else(|e| {
-            eprintln!("cannot access logs dir {d:?}: {e}");
-            std::process::exit(1);
+    let logs_dirs: Vec<PathBuf> = config
+        .logs_dirs
+        .iter()
+        .map(|d| {
+            std::fs::canonicalize(d).unwrap_or_else(|e| {
+                eprintln!("cannot access logs dir {d:?}: {e}");
+                std::process::exit(1);
+            })
         })
-    }).collect();
+        .collect();
 
     let mut root = ChannelNode::default();
     for dir in &logs_dirs {
         discover_channels(dir, &[], &mut root);
     }
 
-    let bind = config.bind.clone();
+    let bind = config
+        .bind
+        .clone();
     let (ai_semaphore, reqwest_client) = match &config.ai {
         Some(ai) => {
-            eprintln!("ai: enabled, model={}, max_concurrent={}", ai.model, ai.max_concurrent);
+            eprintln!(
+                "ai: enabled, model={}, max_concurrent={}",
+                ai.model, ai.max_concurrent
+            );
             (
                 Some(Arc::new(Semaphore::new(ai.max_concurrent))),
                 Some(reqwest::Client::new()),
@@ -180,17 +206,28 @@ async fn main() {
 
     tail::start_watcher(Arc::clone(&state));
 
-    let app = if state.config.base_path.is_empty() {
+    let app = if state
+        .config
+        .base_path
+        .is_empty()
+    {
         server::router().with_state(Arc::clone(&state))
     } else {
         Router::new()
-            .nest(&state.config.base_path, server::router())
+            .nest(
+                &state
+                    .config
+                    .base_path,
+                server::router(),
+            )
             .with_state(Arc::clone(&state))
     };
-    let listener = tokio::net::TcpListener::bind(&bind).await.unwrap_or_else(|e| {
-        eprintln!("cannot bind {bind}: {e}");
-        std::process::exit(1);
-    });
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("cannot bind {bind}: {e}");
+            std::process::exit(1);
+        });
     eprintln!("listening on {bind}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -210,22 +247,28 @@ async fn shutdown_signal() {
     }
 }
 
-fn discover_channels(
-    dir: &Path,
-    segments: &[String],
-    root: &mut ChannelNode,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+fn discover_channels(dir: &Path, segments: &[String], root: &mut ChannelNode) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
 
     let mut subdirs = Vec::new();
     let mut has_logs = false;
 
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+        let name = entry
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+        if entry
+            .file_type()
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+        {
             subdirs.push((name, entry.path()));
         } else if name.ends_with(".log") || name.ends_with(".log.zst") {
-            let date_part = name.strip_suffix(".log")
+            let date_part = name
+                .strip_suffix(".log")
                 .or_else(|| name.strip_suffix(".log.zst"))
                 .unwrap_or("");
             if date_part.len() == 10 {
@@ -245,7 +288,9 @@ fn discover_channels(
 
     // If any sibling subdir starts with #, only recurse into #-prefixed dirs
     // (filters out ZNC private query logs like "qwebirc56163")
-    let has_hash_sibling = subdirs.iter().any(|(name, _)| name.starts_with('#'));
+    let has_hash_sibling = subdirs
+        .iter()
+        .any(|(name, _)| name.starts_with('#'));
     for (name, path) in subdirs {
         if has_hash_sibling && !name.starts_with('#') {
             continue;
@@ -262,10 +307,16 @@ fn detect_channel_format(dir: &Path) -> LogFormat {
     };
 
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = entry
+            .file_name()
+            .to_string_lossy()
+            .to_string();
         if name.ends_with(".log") || name.ends_with(".log.zst") {
             if let Ok(content) = server::read_log_file(&entry.path()) {
-                if let Some(first_line) = content.lines().next() {
+                if let Some(first_line) = content
+                    .lines()
+                    .next()
+                {
                     return parser::detect_format(first_line);
                 }
             }
@@ -278,13 +329,21 @@ fn detect_channel_format(dir: &Path) -> LogFormat {
 fn insert_channel(root: &mut ChannelNode, segments: &[String], dir: ChannelDir) {
     let mut node = root;
     for seg in segments {
-        node = node.children.entry(seg.clone()).or_default();
+        node = node
+            .children
+            .entry(seg.clone())
+            .or_default();
     }
     if let Some(channel) = &mut node.channel {
-        channel.dirs.push(dir);
+        channel
+            .dirs
+            .push(dir);
     } else {
         node.channel = Some(Channel {
-            name: segments.last().unwrap().clone(),
+            name: segments
+                .last()
+                .unwrap()
+                .clone(),
             path_segments: segments.to_vec(),
             dirs: vec![dir],
         });

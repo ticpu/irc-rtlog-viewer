@@ -33,11 +33,27 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Response {
-    let mut resp = templates::page(&state.config.title, &state.channels, &state.config.base_path, maud::html! {
-        h1 { (&state.config.title) }
-        p { "Select a channel from the sidebar." }
-    }).into_response();
-    resp.headers_mut().insert(header::CACHE_CONTROL, "private, no-cache".parse().unwrap());
+    let mut resp = templates::page(
+        &state
+            .config
+            .title,
+        &state.channels,
+        &state
+            .config
+            .base_path,
+        maud::html! {
+            h1 { (&state.config.title) }
+            p { "Select a channel from the sidebar." }
+        },
+    )
+    .into_response();
+    resp.headers_mut()
+        .insert(
+            header::CACHE_CONTROL,
+            "private, no-cache"
+                .parse()
+                .unwrap(),
+        );
     resp
 }
 
@@ -61,14 +77,21 @@ async fn wildcard(
     uri: Uri,
     Query(search): Query<SearchQuery>,
 ) -> Response {
-    let path = percent_decode(uri.path().trim_start_matches('/'));
-    let segments: Vec<&str> = path.split('/').collect();
+    let path = percent_decode(
+        uri.path()
+            .trim_start_matches('/'),
+    );
+    let segments: Vec<&str> = path
+        .split('/')
+        .collect();
 
     if segments.is_empty() {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
-    let last = *segments.last().unwrap();
+    let last = *segments
+        .last()
+        .unwrap();
 
     // Check for "ask/stream" (two trailing segments)
     if segments.len() >= 3
@@ -77,13 +100,23 @@ async fn wildcard(
     {
         let channel_segments = &segments[..segments.len() - 2];
         if let Some(channel) = find_channel(&state.channels, channel_segments).cloned() {
-            let query = search.q.unwrap_or_default();
-            return serve_ask_stream(state, channel, &query).await.into_response();
+            let query = search
+                .q
+                .unwrap_or_default();
+            return serve_ask_stream(state, channel, &query)
+                .await
+                .into_response();
         }
     }
 
     // Try to find channel with all segments vs. all-but-last
-    if last == "today" || last == "latest" || last == "search" || last == "ask" || looks_like_date(last) || is_date_raw(last, segments.len()) {
+    if last == "today"
+        || last == "latest"
+        || last == "search"
+        || last == "ask"
+        || looks_like_date(last)
+        || is_date_raw(last, segments.len())
+    {
         let channel_segments = &segments[..segments.len() - 1];
         // Handle YYYY-MM-DD/raw
         let (action, channel_segments) = if last == "raw" && segments.len() >= 2 {
@@ -100,20 +133,31 @@ async fn wildcard(
         if let Some(channel) = find_channel(&state.channels, channel_segments).cloned() {
             return match action {
                 "today" => {
-                    let bp = &state.config.base_path;
-                    let encoded = channel.path_segments.join("/").replace('#', "%23");
+                    let bp = &state
+                        .config
+                        .base_path;
+                    let encoded = channel
+                        .path_segments
+                        .join("/")
+                        .replace('#', "%23");
                     let date = latest_date(&channel);
                     Redirect::temporary(&format!("{bp}/{encoded}/{date}")).into_response()
                 }
-                "latest" => serve_sse(state, &channel).await.into_response(),
+                "latest" => serve_sse(state, &channel)
+                    .await
+                    .into_response(),
                 "search" => {
-                    let query = search.q.unwrap_or_default();
+                    let query = search
+                        .q
+                        .unwrap_or_default();
                     serve_search(&state, &channel, &query).into_response()
                 }
                 "ask" => serve_ask_page(&state, &channel).into_response(),
                 "raw" => {
                     let date = segments[segments.len() - 2];
-                    serve_raw(&channel, date).await.into_response()
+                    serve_raw(&channel, date)
+                        .await
+                        .into_response()
                 }
                 date if looks_like_date(date) => {
                     serve_log_page(&state, &channel, date).into_response()
@@ -125,8 +169,13 @@ async fn wildcard(
 
     // Maybe bare channel path → redirect to latest date
     if let Some(channel) = find_channel(&state.channels, &segments) {
-        let bp = &state.config.base_path;
-        let encoded = channel.path_segments.join("/").replace('#', "%23");
+        let bp = &state
+            .config
+            .base_path;
+        let encoded = channel
+            .path_segments
+            .join("/")
+            .replace('#', "%23");
         let date = latest_date(channel);
         return Redirect::temporary(&format!("{bp}/{encoded}/{date}")).into_response();
     }
@@ -143,9 +192,15 @@ fn looks_like_date(s: &str) -> bool {
     b.len() == 10
         && b[4] == b'-'
         && b[7] == b'-'
-        && b[..4].iter().all(u8::is_ascii_digit)
-        && b[5..7].iter().all(u8::is_ascii_digit)
-        && b[8..10].iter().all(u8::is_ascii_digit)
+        && b[..4]
+            .iter()
+            .all(u8::is_ascii_digit)
+        && b[5..7]
+            .iter()
+            .all(u8::is_ascii_digit)
+        && b[8..10]
+            .iter()
+            .all(u8::is_ascii_digit)
 }
 
 fn today_date() -> String {
@@ -178,10 +233,9 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 result.push(byte as char);
                 i += 3;
                 continue;
@@ -193,15 +247,16 @@ fn percent_decode(s: &str) -> String {
     result
 }
 
-fn find_channel<'a>(
-    node: &'a crate::ChannelNode,
-    segments: &[&str],
-) -> Option<&'a crate::Channel> {
+fn find_channel<'a>(node: &'a crate::ChannelNode, segments: &[&str]) -> Option<&'a crate::Channel> {
     let mut current = node;
     for seg in segments {
-        current = current.children.get(*seg)?;
+        current = current
+            .children
+            .get(*seg)?;
     }
-    current.channel.as_ref()
+    current
+        .channel
+        .as_ref()
 }
 
 fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Response {
@@ -214,7 +269,11 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
     let content = match read_log_file(&path) {
         Ok(c) => c,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("read error: {e}")).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read error: {e}"),
+            )
+                .into_response();
         }
     };
 
@@ -224,13 +283,21 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
         .collect();
 
     let dates = channel_dates(channel);
-    let idx = dates.iter().position(|d| d == date);
-    let prev = idx.and_then(|i| if i > 0 { dates.get(i - 1) } else { None }).map(|s| s.as_str());
-    let next = idx.and_then(|i| dates.get(i + 1)).map(|s| s.as_str());
+    let idx = dates
+        .iter()
+        .position(|d| d == date);
+    let prev = idx
+        .and_then(|i| if i > 0 { dates.get(i - 1) } else { None })
+        .map(|s| s.as_str());
+    let next = idx
+        .and_then(|i| dates.get(i + 1))
+        .map(|s| s.as_str());
     let is_today = date == today_date();
 
     let mut resp = templates::log_page(&templates::LogPageContext {
-        title: &state.config.title,
+        title: &state
+            .config
+            .title,
         tree: &state.channels,
         channel,
         date,
@@ -238,23 +305,57 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
         prev_date: prev,
         next_date: next,
         is_today,
-        ai_enabled: state.config.ai.is_some(),
-        base_path: &state.config.base_path,
-    }).into_response();
+        ai_enabled: state
+            .config
+            .ai
+            .is_some(),
+        base_path: &state
+            .config
+            .base_path,
+    })
+    .into_response();
     let cc = if is_today {
         "public, max-age=30, s-maxage=120"
     } else {
         "public, max-age=3600, s-maxage=86400"
     };
-    resp.headers_mut().insert(header::CACHE_CONTROL, cc.parse().unwrap());
+    resp.headers_mut()
+        .insert(
+            header::CACHE_CONTROL,
+            cc.parse()
+                .unwrap(),
+        );
     resp
 }
 
 fn serve_search(state: &AppState, channel: &crate::Channel, query: &str) -> Response {
-    let results = search_channel(channel, query, state.config.search_limit);
-    let mut resp = templates::search_page(&state.config.title, &state.channels, channel, query, &results, &state.config.base_path)
-        .into_response();
-    resp.headers_mut().insert(header::CACHE_CONTROL, "private, no-cache".parse().unwrap());
+    let results = search_channel(
+        channel,
+        query,
+        state
+            .config
+            .search_limit,
+    );
+    let mut resp = templates::search_page(
+        &state
+            .config
+            .title,
+        &state.channels,
+        channel,
+        query,
+        &results,
+        &state
+            .config
+            .base_path,
+    )
+    .into_response();
+    resp.headers_mut()
+        .insert(
+            header::CACHE_CONTROL,
+            "private, no-cache"
+                .parse()
+                .unwrap(),
+        );
     resp
 }
 
@@ -268,17 +369,19 @@ async fn serve_raw(channel: &crate::Channel, date: &str) -> Response {
         "public, max-age=86400, s-maxage=604800"
     };
     match read_log_file(&path) {
-        Ok(content) => {
-            (
-                [
-                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                    cache_control(cc),
-                ],
-                content,
-            )
-                .into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("read error: {e}")).into_response(),
+        Ok(content) => (
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                cache_control(cc),
+            ],
+            content,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read error: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -286,9 +389,14 @@ async fn serve_sse(
     state: Arc<AppState>,
     channel: &crate::Channel,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let key = channel.path_segments.join("/");
+    let key = channel
+        .path_segments
+        .join("/");
     let rx = {
-        let mut senders = state.sse_senders.write().await;
+        let mut senders = state
+            .sse_senders
+            .write()
+            .await;
         let sender = senders
             .entry(key)
             .or_insert_with(|| broadcast::channel(256).0);
@@ -308,7 +416,11 @@ pub fn read_log_file(path: &Path) -> io::Result<String> {
     let file = std::fs::File::open(path)?;
     let mut content = String::new();
 
-    if path.extension().and_then(|e| e.to_str()) == Some("zst") {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        == Some("zst")
+    {
         let mut decoder = zstd::Decoder::new(BufReader::new(file))?;
         decoder.read_to_string(&mut content)?;
     } else {
@@ -319,13 +431,20 @@ pub fn read_log_file(path: &Path) -> io::Result<String> {
     Ok(content)
 }
 
-pub fn resolve_log_path(channel: &crate::Channel, date: &str) -> Option<(std::path::PathBuf, LogFormat)> {
+pub fn resolve_log_path(
+    channel: &crate::Channel,
+    date: &str,
+) -> Option<(std::path::PathBuf, LogFormat)> {
     for dir in &channel.dirs {
-        let plain = dir.path.join(format!("{date}.log"));
+        let plain = dir
+            .path
+            .join(format!("{date}.log"));
         if plain.exists() {
             return Some((plain, dir.format));
         }
-        let zst = dir.path.join(format!("{date}.log.zst"));
+        let zst = dir
+            .path
+            .join(format!("{date}.log.zst"));
         if zst.exists() {
             return Some((zst, dir.format));
         }
@@ -335,16 +454,27 @@ pub fn resolve_log_path(channel: &crate::Channel, date: &str) -> Option<(std::pa
 
 fn latest_date(channel: &crate::Channel) -> String {
     let dates = channel_dates(channel);
-    dates.last().cloned().unwrap_or_else(today_date)
+    dates
+        .last()
+        .cloned()
+        .unwrap_or_else(today_date)
 }
 
 pub fn channel_dates(channel: &crate::Channel) -> Vec<String> {
     let mut dates = std::collections::BTreeSet::new();
     for dir in &channel.dirs {
-        let Ok(entries) = std::fs::read_dir(&dir.path) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir.path) else {
+            continue;
+        };
         for entry in entries.flatten() {
-            let Ok(name) = entry.file_name().into_string() else { continue };
-            let date = name.strip_suffix(".log")
+            let Ok(name) = entry
+                .file_name()
+                .into_string()
+            else {
+                continue;
+            };
+            let date = name
+                .strip_suffix(".log")
                 .or_else(|| name.strip_suffix(".log.zst"));
             if let Some(d) = date {
                 if d.len() == 10 {
@@ -353,24 +483,46 @@ pub fn channel_dates(channel: &crate::Channel) -> Vec<String> {
             }
         }
     }
-    dates.into_iter().collect()
+    dates
+        .into_iter()
+        .collect()
 }
 
 fn serve_ask_page(state: &AppState, channel: &crate::Channel) -> Response {
-    if state.config.ai.is_none() {
+    if state
+        .config
+        .ai
+        .is_none()
+    {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    let mut resp = templates::ask_page(&state.config.title, &state.channels, channel, &state.config.base_path).into_response();
-    resp.headers_mut().insert(header::CACHE_CONTROL, "private, no-cache".parse().unwrap());
+    let mut resp = templates::ask_page(
+        &state
+            .config
+            .title,
+        &state.channels,
+        channel,
+        &state
+            .config
+            .base_path,
+    )
+    .into_response();
+    resp.headers_mut()
+        .insert(
+            header::CACHE_CONTROL,
+            "private, no-cache"
+                .parse()
+                .unwrap(),
+        );
     resp
 }
 
-async fn serve_ask_stream(
-    state: Arc<AppState>,
-    channel: crate::Channel,
-    query: &str,
-) -> Response {
-    if state.config.ai.is_none() {
+async fn serve_ask_stream(state: Arc<AppState>, channel: crate::Channel, query: &str) -> Response {
+    if state
+        .config
+        .ai
+        .is_none()
+    {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
@@ -379,8 +531,14 @@ async fn serve_ask_stream(
         return (StatusCode::BAD_REQUEST, "query is required").into_response();
     }
 
-    let semaphore = state.ai_semaphore.as_ref().unwrap();
-    let permit = match semaphore.clone().try_acquire_owned() {
+    let semaphore = state
+        .ai_semaphore
+        .as_ref()
+        .unwrap();
+    let permit = match semaphore
+        .clone()
+        .try_acquire_owned()
+    {
         Ok(p) => p,
         Err(_) => {
             return (
@@ -425,7 +583,11 @@ async fn serve_ask_stream(
                 ("ask_error", serde_json::json!({"error": msg}).to_string())
             }
         };
-        Ok::<_, std::convert::Infallible>(Event::default().event(event_type).data(data))
+        Ok::<_, std::convert::Infallible>(
+            Event::default()
+                .event(event_type)
+                .data(data),
+        )
     });
 
     Sse::new(stream)
@@ -437,7 +599,10 @@ async fn serve_ask_output(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> Response {
-    let ai_config = match &state.config.ai {
+    let ai_config = match &state
+        .config
+        .ai
+    {
         Some(c) => c,
         None => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
@@ -449,29 +614,52 @@ async fn serve_ask_output(
         return (StatusCode::BAD_REQUEST, "invalid filename").into_response();
     }
     if filename.ends_with(".md") {
-        let path = ai_config.output_dir.join(&filename);
+        let path = ai_config
+            .output_dir
+            .join(&filename);
         return match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                (
-                    [
-                        (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                        cache_control("public, max-age=3600, s-maxage=86400"),
-                    ],
-                    content,
-                )
-                    .into_response()
-            }
+            Ok(content) => (
+                [
+                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                    cache_control("public, max-age=3600, s-maxage=86400"),
+                ],
+                content,
+            )
+                .into_response(),
             Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
         };
     }
 
     if filename.ends_with(".html") {
-        let md_name = format!("{}.md", filename.strip_suffix(".html").unwrap());
-        let path = ai_config.output_dir.join(&md_name);
+        let md_name = format!(
+            "{}.md",
+            filename
+                .strip_suffix(".html")
+                .unwrap()
+        );
+        let path = ai_config
+            .output_dir
+            .join(&md_name);
         return match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let mut resp = templates::ask_output_page(&state.config.title, &md_name, &content, &state.config.base_path).into_response();
-                resp.headers_mut().insert(header::CACHE_CONTROL, "public, max-age=3600, s-maxage=86400".parse().unwrap());
+                let mut resp = templates::ask_output_page(
+                    &state
+                        .config
+                        .title,
+                    &md_name,
+                    &content,
+                    &state
+                        .config
+                        .base_path,
+                )
+                .into_response();
+                resp.headers_mut()
+                    .insert(
+                        header::CACHE_CONTROL,
+                        "public, max-age=3600, s-maxage=86400"
+                            .parse()
+                            .unwrap(),
+                    );
                 resp
             }
             Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),

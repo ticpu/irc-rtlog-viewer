@@ -1,12 +1,14 @@
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::parser::{LineKind, LogLine};
-use crate::{ChannelNode, Channel};
+use crate::{Channel, ChannelNode};
 
 fn nick_hue(nick: &str) -> u16 {
     let mut hash: u32 = 5381;
     for b in nick.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(u32::from(b));
+        hash = hash
+            .wrapping_mul(33)
+            .wrapping_add(u32::from(b));
     }
     (hash % 360) as u16
 }
@@ -42,7 +44,9 @@ pub fn linkify(text: &str) -> Markup {
         let before = &text[last..i];
 
         result.push_str(&maud::html! { (before) }.into_string());
-        result.push_str(&maud::html! { a href=(url) target="_blank" rel="noopener" { (url) } }.into_string());
+        result.push_str(
+            &maud::html! { a href=(url) target="_blank" rel="noopener" { (url) } }.into_string(),
+        );
         last = i + url_end;
     }
 
@@ -54,9 +58,17 @@ pub fn linkify(text: &str) -> Markup {
 }
 
 pub fn render_line(line: &LogLine) -> Markup {
-    let anchor = line.time.to_anchor();
-    let ts = line.time.to_hms();
-    let class = if line.is_event() { "line event" } else { "line" };
+    let anchor = line
+        .time
+        .to_anchor();
+    let ts = line
+        .time
+        .to_hms();
+    let class = if line.is_event() {
+        "line event"
+    } else {
+        "line"
+    };
 
     html! {
         div class=(class) id=(&anchor) {
@@ -188,51 +200,58 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
     let is_today = ctx.is_today;
     let ai_enabled = ctx.ai_enabled;
     let bp = ctx.base_path;
-    let encoded = channel.path_segments.join("/").replace('#', "%23");
-    page(title, tree, bp, html! {
-        header id="log-header" {
-            h1 { (&channel.name) " — " (date) }
-            div.nav-links {
-                @if let Some(prev) = prev_date {
-                    a href=(format!("{bp}/{encoded}/{prev}")) { "← " (prev) }
-                }
-                " "
-                input type="date" value=(date)
-                    onchange="window.location.href=this.value"
-                    ;
-                " "
-                @if let Some(next) = next_date {
-                    a href=(format!("{bp}/{encoded}/{next}")) { (next) " →" }
-                }
-                " | "
-                a href=(format!("{bp}/{encoded}/today")) { "today" }
-                " "
-                a href=(format!("{bp}/{encoded}/{date}/raw")) { "raw" }
-            }
-            div.controls {
-                label {
-                    input id="toggle-events" type="checkbox" checked;
-                    " show events"
-                }
-                " "
-                form.search-form action=(format!("{bp}/{encoded}/search")) method="get" {
-                    input type="text" name="q" placeholder="search…";
-                    button type="submit" { "go" }
-                }
-                @if ai_enabled {
+    let encoded = channel
+        .path_segments
+        .join("/")
+        .replace('#', "%23");
+    page(
+        title,
+        tree,
+        bp,
+        html! {
+            header id="log-header" {
+                h1 { (&channel.name) " — " (date) }
+                div.nav-links {
+                    @if let Some(prev) = prev_date {
+                        a href=(format!("{bp}/{encoded}/{prev}")) { "← " (prev) }
+                    }
                     " "
-                    a href=(format!("{bp}/{encoded}/ask")) { "ask" }
+                    input type="date" value=(date)
+                        onchange="window.location.href=this.value"
+                        ;
+                    " "
+                    @if let Some(next) = next_date {
+                        a href=(format!("{bp}/{encoded}/{next}")) { (next) " →" }
+                    }
+                    " | "
+                    a href=(format!("{bp}/{encoded}/today")) { "today" }
+                    " "
+                    a href=(format!("{bp}/{encoded}/{date}/raw")) { "raw" }
+                }
+                div.controls {
+                    label {
+                        input id="toggle-events" type="checkbox" checked;
+                        " show events"
+                    }
+                    " "
+                    form.search-form action=(format!("{bp}/{encoded}/search")) method="get" {
+                        input type="text" name="q" placeholder="search…";
+                        button type="submit" { "go" }
+                    }
+                    @if ai_enabled {
+                        " "
+                        a href=(format!("{bp}/{encoded}/ask")) { "ask" }
+                    }
                 }
             }
-        }
-        div id="log" data-channel=(&encoded) {
-            @for line in lines {
-                (render_line(line))
+            div id="log" data-channel=(&encoded) {
+                @for line in lines {
+                    (render_line(line))
+                }
             }
-        }
-        @if is_today {
-            script {
-                (PreEscaped(format!(r#"
+            @if is_today {
+                script {
+                    (PreEscaped(format!(r#"
 (function() {{
     var log = document.getElementById('log');
     var src = new EventSource('{bp}/' + log.dataset.channel + '/latest');
@@ -250,10 +269,10 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
     }});
 }})();
 "#)))
-            }
-        } @else {
-            script {
-                (PreEscaped(r#"
+                }
+            } @else {
+                script {
+                    (PreEscaped(r#"
 (function() {
     var cb = document.getElementById('toggle-events');
     var log = document.getElementById('log');
@@ -262,9 +281,10 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
     });
 })();
 "#))
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 pub fn search_page(
@@ -275,75 +295,90 @@ pub fn search_page(
     results: &[(String, LogLine)],
     base_path: &str,
 ) -> Markup {
-    let encoded = channel.path_segments.join("/").replace('#', "%23");
-    page(title, tree, base_path, html! {
-        header id="log-header" {
-            h1 { (&channel.name) " — search" }
-            div.controls {
-                form.search-form action=(format!("{base_path}/{encoded}/search")) method="get" {
-                    input type="text" name="q" value=(query) placeholder="search…";
-                    button type="submit" { "go" }
+    let encoded = channel
+        .path_segments
+        .join("/")
+        .replace('#', "%23");
+    page(
+        title,
+        tree,
+        base_path,
+        html! {
+            header id="log-header" {
+                h1 { (&channel.name) " — search" }
+                div.controls {
+                    form.search-form action=(format!("{base_path}/{encoded}/search")) method="get" {
+                        input type="text" name="q" value=(query) placeholder="search…";
+                        button type="submit" { "go" }
+                    }
                 }
             }
-        }
-        div id="log" {
-            @if results.is_empty() {
-                p { "no results for \"" (query) "\"" }
-            }
-            @for (date, line) in results {
-                div.line {
-                    a.date href=(format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor())) {
-                        (date)
-                    }
-                    " "
-                    a.ts href=(format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor())) {
-                        (line.time.to_hms())
-                    }
-                    " "
-                    @match &line.kind {
-                        LineKind::Message { nick, text } => {
-                            span.nick style=(nick_color_style(nick)) { "<" (nick) ">" }
-                            " "
-                            span.msg { (linkify(text)) }
-                        },
-                        LineKind::Action { nick, text } => {
-                            span.action {
-                                "* "
-                                span.nick style=(nick_color_style(nick)) { (nick) }
+            div id="log" {
+                @if results.is_empty() {
+                    p { "no results for \"" (query) "\"" }
+                }
+                @for (date, line) in results {
+                    div.line {
+                        a.date href=(format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor())) {
+                            (date)
+                        }
+                        " "
+                        a.ts href=(format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor())) {
+                            (line.time.to_hms())
+                        }
+                        " "
+                        @match &line.kind {
+                            LineKind::Message { nick, text } => {
+                                span.nick style=(nick_color_style(nick)) { "<" (nick) ">" }
                                 " "
-                                (linkify(text))
-                            }
-                        },
-                        _ => {
-                            span.ev { "event" }
-                        },
+                                span.msg { (linkify(text)) }
+                            },
+                            LineKind::Action { nick, text } => {
+                                span.action {
+                                    "* "
+                                    span.nick style=(nick_color_style(nick)) { (nick) }
+                                    " "
+                                    (linkify(text))
+                                }
+                            },
+                            _ => {
+                                span.ev { "event" }
+                            },
+                        }
                     }
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel, base_path: &str) -> Markup {
-    let encoded = channel.path_segments.join("/").replace('#', "%23");
-    page(title, tree, base_path, html! {
-        header id="log-header" {
-            h1 { (&channel.name) " — ask" }
-            div.nav-links {
-                a href=(format!("{base_path}/{encoded}/today")) { "back to logs" }
+    let encoded = channel
+        .path_segments
+        .join("/")
+        .replace('#', "%23");
+    page(
+        title,
+        tree,
+        base_path,
+        html! {
+            header id="log-header" {
+                h1 { (&channel.name) " — ask" }
+                div.nav-links {
+                    a href=(format!("{base_path}/{encoded}/today")) { "back to logs" }
+                }
             }
-        }
-        div id="ask-container" {
-            form id="ask-form" {
-                input type="text" name="q" placeholder="ask about logs…" autocomplete="off";
-                button type="submit" { "ask" }
+            div id="ask-container" {
+                form id="ask-form" {
+                    input type="text" name="q" placeholder="ask about logs…" autocomplete="off";
+                    button type="submit" { "ask" }
+                }
+                div id="ask-links" style="display:none" {}
+                iframe id="ask-result" style="display:none" {}
+                div id="ask-log" {}
             }
-            div id="ask-links" style="display:none" {}
-            iframe id="ask-result" style="display:none" {}
-            div id="ask-log" {}
-        }
-        script {
-            (PreEscaped(format!(r#"
+            script {
+                (PreEscaped(format!(r#"
 (function() {{
     var form = document.getElementById('ask-form');
     var log = document.getElementById('ask-log');
@@ -427,8 +462,9 @@ pub fn ask_page(title: &str, tree: &ChannelNode, channel: &Channel, base_path: &
     }};
 }})();
 "#)))
-        }
-    })
+            }
+        },
+    )
 }
 
 pub fn ask_output_page(title: &str, md_filename: &str, content: &str, base_path: &str) -> Markup {

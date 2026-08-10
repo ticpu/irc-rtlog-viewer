@@ -7,13 +7,22 @@ use tokio::sync::mpsc;
 use crate::AppState;
 use crate::Channel;
 use crate::parser::parse_line;
-use crate::server::{channel_dates, resolve_log_path, read_log_file};
+use crate::server::{channel_dates, read_log_file, resolve_log_path};
 
 pub enum SseEvent {
-    ToolCall { name: String, input_summary: String },
-    ToolResult { name: String, output_preview: String },
+    ToolCall {
+        name: String,
+        input_summary: String,
+    },
+    ToolResult {
+        name: String,
+        output_preview: String,
+    },
     Display(String),
-    Done { url: String, output: String },
+    Done {
+        url: String,
+        output: String,
+    },
     Error(String),
 }
 
@@ -36,8 +45,15 @@ Rules:
 ";
 
 fn build_system_prompt(state: &AppState) -> String {
-    let ai_config = state.config.ai.as_ref().unwrap();
-    let base = ai_config.system_prompt.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT);
+    let ai_config = state
+        .config
+        .ai
+        .as_ref()
+        .unwrap();
+    let base = ai_config
+        .system_prompt
+        .as_deref()
+        .unwrap_or(DEFAULT_SYSTEM_PROMPT);
     let mut prompt = String::from(base);
     prompt.push_str("\nAvailable channels:\n");
     collect_channels(&state.channels, &mut prompt);
@@ -46,8 +62,13 @@ fn build_system_prompt(state: &AppState) -> String {
 
 fn collect_channels(node: &crate::ChannelNode, out: &mut String) {
     if let Some(channel) = &node.channel {
-        if channel.name.starts_with('#') {
-            let path = channel.path_segments.join("/");
+        if channel
+            .name
+            .starts_with('#')
+        {
+            let path = channel
+                .path_segments
+                .join("/");
             let dates = channel_dates(channel);
             if let (Some(first), Some(last)) = (dates.first(), dates.last()) {
                 out.push_str(&format!(
@@ -60,7 +81,10 @@ fn collect_channels(node: &crate::ChannelNode, out: &mut String) {
             }
         }
     }
-    for child in node.children.values() {
+    for child in node
+        .children
+        .values()
+    {
         collect_channels(child, out);
     }
 }
@@ -209,16 +233,27 @@ fn validate_channel<'a>(
     channel_path: &str,
     channels: &'a crate::ChannelNode,
 ) -> Result<&'a Channel, String> {
-    let segments: Vec<&str> = channel_path.split('/').collect();
+    let segments: Vec<&str> = channel_path
+        .split('/')
+        .collect();
     let mut node = channels;
     for seg in &segments {
-        match node.children.get(*seg) {
+        match node
+            .children
+            .get(*seg)
+        {
             Some(child) => node = child,
             None => return Err(format!("unknown channel: {channel_path}")),
         }
     }
     match &node.channel {
-        Some(ch) if ch.name.starts_with('#') => Ok(ch),
+        Some(ch)
+            if ch
+                .name
+                .starts_with('#') =>
+        {
+            Ok(ch)
+        }
         Some(_) => Err(format!("channel not accessible: {channel_path}")),
         None => Err(format!("not a channel: {channel_path}")),
     }
@@ -246,15 +281,41 @@ fn execute_search(input: &Value, state: &AppState) -> String {
         Err(e) => return format!("invalid regex: {e}"),
     };
 
-    let count_only = input["n"].as_bool().unwrap_or(false);
-    let include_events = input["events"].as_bool().unwrap_or(false);
-    let max_results = input["c"].as_u64().unwrap_or(50) as usize;
-    let context_after = input["C"].as_u64().unwrap_or(0).max(input["A"].as_u64().unwrap_or(0)) as usize;
-    let context_before = input["C"].as_u64().unwrap_or(0).max(input["B"].as_u64().unwrap_or(0)) as usize;
+    let count_only = input["n"]
+        .as_bool()
+        .unwrap_or(false);
+    let include_events = input["events"]
+        .as_bool()
+        .unwrap_or(false);
+    let max_results = input["c"]
+        .as_u64()
+        .unwrap_or(50) as usize;
+    let context_after = input["C"]
+        .as_u64()
+        .unwrap_or(0)
+        .max(
+            input["A"]
+                .as_u64()
+                .unwrap_or(0),
+        ) as usize;
+    let context_before = input["C"]
+        .as_u64()
+        .unwrap_or(0)
+        .max(
+            input["B"]
+                .as_u64()
+                .unwrap_or(0),
+        ) as usize;
 
-    let specific_date = input["date"].as_str().filter(|d| d.len() == 10);
-    let from_date = input["from_date"].as_str().filter(|d| d.len() == 10);
-    let to_date = input["to_date"].as_str().filter(|d| d.len() == 10);
+    let specific_date = input["date"]
+        .as_str()
+        .filter(|d| d.len() == 10);
+    let from_date = input["from_date"]
+        .as_str()
+        .filter(|d| d.len() == 10);
+    let to_date = input["to_date"]
+        .as_str()
+        .filter(|d| d.len() == 10);
     let oldest_first = input["order"].as_str() == Some("oldest");
 
     let dates: Vec<String> = if let Some(date) = specific_date {
@@ -284,14 +345,23 @@ fn execute_search(input: &Value, state: &AppState) -> String {
         }
         dates_scanned += 1;
 
-        let Some((path, format)) = resolve_log_path(channel, date) else { continue };
-        let Ok(content) = read_log_file(&path) else { continue };
-        let all_lines: Vec<&str> = content.lines().collect();
+        let Some((path, format)) = resolve_log_path(channel, date) else {
+            continue;
+        };
+        let Ok(content) = read_log_file(&path) else {
+            continue;
+        };
+        let all_lines: Vec<&str> = content
+            .lines()
+            .collect();
 
         let mut date_matches = 0;
         let mut emitted_lines: BTreeSet<usize> = BTreeSet::new();
 
-        for (i, line) in all_lines.iter().enumerate() {
+        for (i, line) in all_lines
+            .iter()
+            .enumerate()
+        {
             if re.is_match(line) {
                 if !include_events {
                     if let Some(parsed) = parse_line(line, format) {
@@ -321,7 +391,9 @@ fn execute_search(input: &Value, state: &AppState) -> String {
             continue;
         }
 
-        out.push_str(&format!("--- {channel_path} {date} ({date_matches} matches) ---\n"));
+        out.push_str(&format!(
+            "--- {channel_path} {date} ({date_matches} matches) ---\n"
+        ));
         let mut prev_line: Option<usize> = None;
         for j in &emitted_lines {
             if !include_events {
@@ -396,7 +468,9 @@ fn execute_copy(input: &Value, state: &AppState, output_buf: &mut String) -> Str
         return format!("error reading log for {date}");
     };
 
-    let all_lines: Vec<&str> = content.lines().collect();
+    let all_lines: Vec<&str> = content
+        .lines()
+        .collect();
     output_buf.push_str(&format!("--- {channel_path} {date} ---\n"));
     let mut copied = 0;
     for n in &line_nums {
@@ -417,8 +491,13 @@ fn execute_copy(input: &Value, state: &AppState, output_buf: &mut String) -> Str
 }
 
 fn execute_output(input: &Value, output_buf: &mut String) -> String {
-    let text = input["text"].as_str().unwrap_or("");
-    if input["clear"].as_bool().unwrap_or(false) {
+    let text = input["text"]
+        .as_str()
+        .unwrap_or("");
+    if input["clear"]
+        .as_bool()
+        .unwrap_or(false)
+    {
         output_buf.clear();
     }
     output_buf.push_str(text);
@@ -443,21 +522,29 @@ fn execute_done(
         _ => return "error: title is required".into(),
     };
 
-    let ai_config = state.config.ai.as_ref().unwrap();
+    let ai_config = state
+        .config
+        .ai
+        .as_ref()
+        .unwrap();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let slug = slugify(title);
     let filename = format!("{ts}-{slug}.md");
-    let path = ai_config.output_dir.join(&filename);
+    let path = ai_config
+        .output_dir
+        .join(&filename);
 
     if let Err(e) = std::fs::write(&path, output_buf) {
         eprintln!("ai: failed to write {}: {e}", path.display());
         return format!("error writing file: {e}");
     }
 
-    let base_path = &state.config.base_path;
+    let base_path = &state
+        .config
+        .base_path;
     let url = format!("{base_path}/ask/output/{ts}-{slug}.html");
 
     let _ = tx.send(SseEvent::Done {
@@ -469,15 +556,15 @@ fn execute_done(
 }
 
 fn execute_display(input: &Value, tx: &mpsc::UnboundedSender<SseEvent>) -> String {
-    let text = input["text"].as_str().unwrap_or("");
+    let text = input["text"]
+        .as_str()
+        .unwrap_or("");
     let _ = tx.send(SseEvent::Display(text.to_string()));
     "ok".into()
 }
 
 fn execute_abort(tx: &mpsc::UnboundedSender<SseEvent>) -> String {
-    let _ = tx.send(SseEvent::Error(
-        "no relevant results found".into(),
-    ));
+    let _ = tx.send(SseEvent::Error("no relevant results found".into()));
     "aborted".into()
 }
 
@@ -487,7 +574,10 @@ pub async fn run_ai_session(
     state: Arc<AppState>,
     tx: mpsc::UnboundedSender<SseEvent>,
 ) {
-    let ai_config = match &state.config.ai {
+    let ai_config = match &state
+        .config
+        .ai
+    {
         Some(c) => c,
         None => {
             let _ = tx.send(SseEvent::Error("AI not configured".into()));
@@ -506,8 +596,12 @@ pub async fn run_ai_session(
 
     let system_prompt = build_system_prompt(&state);
     let tools = build_tool_definitions();
-    let model = ai_config.model.clone();
-    let api_key = ai_config.api_key.clone();
+    let model = ai_config
+        .model
+        .clone();
+    let api_key = ai_config
+        .api_key
+        .clone();
 
     let mut messages: Vec<Value> = vec![json!({
         "role": "user",
@@ -550,7 +644,10 @@ pub async fn run_ai_session(
                     last_block["cache_control"] = json!({"type": "ephemeral"});
                 }
             } else if last_msg["content"].is_string() {
-                let text = last_msg["content"].as_str().unwrap().to_string();
+                let text = last_msg["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
                 last_msg["content"] = json!([{
                     "type": "text",
                     "text": text,
@@ -587,7 +684,10 @@ pub async fn run_ai_session(
         };
 
         let status = resp.status();
-        let resp_text = match resp.text().await {
+        let resp_text = match resp
+            .text()
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("ai: API read failed: {e}");
@@ -612,16 +712,26 @@ pub async fn run_ai_session(
         };
 
         if let Some(usage) = resp_json.get("usage") {
-            let input = usage["input_tokens"].as_u64().unwrap_or(0);
-            let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            let output = usage["output_tokens"].as_u64().unwrap_or(0);
+            let input = usage["input_tokens"]
+                .as_u64()
+                .unwrap_or(0);
+            let cache_create = usage["cache_creation_input_tokens"]
+                .as_u64()
+                .unwrap_or(0);
+            let cache_read = usage["cache_read_input_tokens"]
+                .as_u64()
+                .unwrap_or(0);
+            let output = usage["output_tokens"]
+                .as_u64()
+                .unwrap_or(0);
             eprintln!(
                 "ai: tokens: input={input} cache_create={cache_create} cache_read={cache_read} output={output}"
             );
         }
 
-        let stop_reason = resp_json["stop_reason"].as_str().unwrap_or("");
+        let stop_reason = resp_json["stop_reason"]
+            .as_str()
+            .unwrap_or("");
         let content = resp_json["content"].as_array();
 
         if stop_reason == "end_turn" {
@@ -636,12 +746,18 @@ pub async fn run_ai_session(
                 }
             }
 
-            if !text_content.trim().is_empty() {
+            if !text_content
+                .trim()
+                .is_empty()
+            {
                 output_buf.push_str(&text_content);
                 output_buf.push('\n');
             }
 
-            if !output_buf.trim().is_empty() {
+            if !output_buf
+                .trim()
+                .is_empty()
+            {
                 let done_input = json!({"title": query});
                 execute_done(&done_input, &state, &output_buf, &tx);
             } else {
@@ -667,8 +783,12 @@ pub async fn run_ai_session(
                     continue;
                 }
 
-                let tool_name = block["name"].as_str().unwrap_or("");
-                let tool_id = block["id"].as_str().unwrap_or("");
+                let tool_name = block["name"]
+                    .as_str()
+                    .unwrap_or("");
+                let tool_id = block["id"]
+                    .as_str()
+                    .unwrap_or("");
                 let tool_input = &block["input"];
 
                 let silent = matches!(tool_name, "display" | "abort");
@@ -731,8 +851,12 @@ pub async fn run_ai_session(
 fn summarize_input(tool_name: &str, input: &Value) -> String {
     match tool_name {
         "search" => {
-            let pattern = input["pattern"].as_str().unwrap_or("?");
-            let channel = input["channel"].as_str().unwrap_or("?");
+            let pattern = input["pattern"]
+                .as_str()
+                .unwrap_or("?");
+            let channel = input["channel"]
+                .as_str()
+                .unwrap_or("?");
             let mut s = format!("pattern={pattern:?}, channel={channel}");
             if let Some(date) = input["date"].as_str() {
                 s.push_str(&format!(", date={date}"));
@@ -746,7 +870,10 @@ fn summarize_input(tool_name: &str, input: &Value) -> String {
             if let Some(order) = input["order"].as_str() {
                 s.push_str(&format!(", order={order}"));
             }
-            if input["n"].as_bool().unwrap_or(false) {
+            if input["n"]
+                .as_bool()
+                .unwrap_or(false)
+            {
                 s.push_str(", count-only");
             }
             if let Some(c) = input["C"].as_u64() {
@@ -755,22 +882,34 @@ fn summarize_input(tool_name: &str, input: &Value) -> String {
             s
         }
         "copy" => {
-            let channel = input["channel"].as_str().unwrap_or("?");
-            let date = input["date"].as_str().unwrap_or("?");
-            let lines = input["lines"].as_str().unwrap_or("?");
+            let channel = input["channel"]
+                .as_str()
+                .unwrap_or("?");
+            let date = input["date"]
+                .as_str()
+                .unwrap_or("?");
+            let lines = input["lines"]
+                .as_str()
+                .unwrap_or("?");
             format!("{channel} {date} lines={lines}")
         }
         "output" => {
-            let text = input["text"].as_str().unwrap_or("");
+            let text = input["text"]
+                .as_str()
+                .unwrap_or("");
             let preview = if text.len() > 60 { &text[..60] } else { text };
             format!("{preview:?}")
         }
         "done" => {
-            let title = input["title"].as_str().unwrap_or("?");
+            let title = input["title"]
+                .as_str()
+                .unwrap_or("?");
             format!("title={title:?}")
         }
         "display" => {
-            let text = input["text"].as_str().unwrap_or("");
+            let text = input["text"]
+                .as_str()
+                .unwrap_or("");
             let preview = if text.len() > 80 { &text[..80] } else { text };
             preview.to_string()
         }
@@ -789,9 +928,13 @@ pub fn slugify(title: &str) -> String {
             slug.push('-');
         }
     }
-    let slug = slug.trim_matches('-').to_string();
+    let slug = slug
+        .trim_matches('-')
+        .to_string();
     if slug.len() > 120 {
-        slug[..120].trim_end_matches('-').to_string()
+        slug[..120]
+            .trim_end_matches('-')
+            .to_string()
     } else {
         slug
     }
@@ -801,7 +944,10 @@ pub fn parse_line_spec(spec: &str) -> Result<BTreeSet<usize>, String> {
     if spec.is_empty() {
         return Err("empty line spec".into());
     }
-    if !spec.bytes().all(|b| b.is_ascii_digit() || b == b',' || b == b'-') {
+    if !spec
+        .bytes()
+        .all(|b| b.is_ascii_digit() || b == b',' || b == b'-')
+    {
         return Err("invalid line spec: only digits, commas, and hyphens allowed".into());
     }
 

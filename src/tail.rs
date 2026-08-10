@@ -3,10 +3,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use notify::{Event, EventKind, RecursiveMode, Watcher};
 use crate::AppState;
 use crate::parser::{LogFormat, parse_line};
 use crate::templates::render_line;
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 pub fn start_watcher(state: Arc<AppState>) {
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
@@ -37,7 +37,9 @@ fn tail_loop(
         }
 
         for path in &event.paths {
-            let Some(ext) = path.extension() else { continue };
+            let Some(ext) = path.extension() else {
+                continue;
+            };
             if ext != "log" {
                 continue;
             }
@@ -51,7 +53,9 @@ fn tail_loop(
                 continue;
             }
 
-            let senders = state.sse_senders.blocking_read();
+            let senders = state
+                .sse_senders
+                .blocking_read();
             let Some(sender) = senders.get(&channel_key) else {
                 continue;
             };
@@ -77,14 +81,20 @@ fn read_new_bytes(path: &PathBuf, positions: &mut HashMap<PathBuf, u64>) -> Stri
         return String::new();
     };
     let size = meta.len();
-    let pos = positions.get(path).copied().unwrap_or(0);
+    let pos = positions
+        .get(path)
+        .copied()
+        .unwrap_or(0);
 
     if size <= pos {
         positions.insert(path.clone(), size);
         return String::new();
     }
 
-    if file.seek(SeekFrom::Start(pos)).is_err() {
+    if file
+        .seek(SeekFrom::Start(pos))
+        .is_err()
+    {
         return String::new();
     }
 
@@ -99,10 +109,21 @@ fn resolve_channel(path: &PathBuf, state: &AppState) -> Option<(String, LogForma
     let parent = abs.parent()?;
     for logs_dir in &state.logs_dirs {
         if let Ok(rel) = parent.strip_prefix(logs_dir) {
-            let segments: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+            let segments: Vec<String> = rel
+                .components()
+                .map(|c| {
+                    c.as_os_str()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect();
             if let Some(channel) = find_channel_in_tree(&state.channels, &segments, 0) {
-                let key = channel.path_segments.join("/");
-                let format = channel.dirs.iter()
+                let key = channel
+                    .path_segments
+                    .join("/");
+                let format = channel
+                    .dirs
+                    .iter()
                     .find(|d| parent.starts_with(&d.path))
                     .map(|d| d.format)
                     .unwrap_or(channel.dirs[0].format);
@@ -119,9 +140,13 @@ fn find_channel_in_tree<'a>(
     depth: usize,
 ) -> Option<&'a crate::Channel> {
     if depth >= segments.len() {
-        return node.channel.as_ref();
+        return node
+            .channel
+            .as_ref();
     }
 
-    let child = node.children.get(&segments[depth])?;
+    let child = node
+        .children
+        .get(&segments[depth])?;
     find_channel_in_tree(child, segments, depth + 1)
 }
