@@ -633,6 +633,13 @@ pub async fn run_ai_session(
     let mut output_buf = String::new();
 
     for _iteration in 0..max_tool_calls {
+        // The permit is held for the whole session, so a client that disconnects
+        // would otherwise keep billing and block the next request.
+        if tx.is_closed() {
+            eprintln!("ask: client disconnected, abandoning session");
+            return;
+        }
+
         let msg_json = serde_json::to_string(&messages).unwrap_or_default();
         if msg_json.len() > 150_000 {
             let _ = tx.send(SseEvent::Error("context limit reached".into()));

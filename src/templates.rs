@@ -377,9 +377,9 @@ pub fn ask_page(
             }
             div id="ask-container" {
                 p.ask-intro {
-                    "Ask a question in plain language and an AI will search the logs and
-                     compile an answer. It searches " strong { (&channel.name) } " by
-                     default, and can search other channels if you name them in your question."
+                    "Ask a question in plain language and an AI will search the logs and compile an answer. It searches "
+                    strong { (&channel.name) }
+                    " by default, and can search other channels if you name them in your question."
                 }
                 form id="ask-form" {
                     input type="text" name="q"
@@ -388,7 +388,7 @@ pub fn ask_page(
                     button type="submit" { "ask AI" }
                 }
                 div id="ask-links" style="display:none" {}
-                iframe id="ask-result" style="display:none" {}
+                iframe id="ask-result" sandbox="" style="display:none" {}
                 div id="ask-log" {}
             }
             script {
@@ -481,10 +481,22 @@ pub fn ask_page(
     )
 }
 
+/// Parses markdown, demoting raw HTML to visible text.
+///
+/// Ask documents embed verbatim IRC lines, so anyone in a logged channel can
+/// plant markup; nothing here has a reason to emit HTML of its own.
+fn markdown_events(content: &str) -> impl Iterator<Item = pulldown_cmark::Event<'_>> {
+    use pulldown_cmark::Event;
+
+    pulldown_cmark::Parser::new(content).map(|event| match event {
+        Event::Html(html) | Event::InlineHtml(html) => Event::Text(html),
+        other => other,
+    })
+}
+
 pub fn ask_output_page(title: &str, md_filename: &str, content: &str, base_path: &str) -> Markup {
     let mut html_output = String::new();
-    let parser = pulldown_cmark::Parser::new(content);
-    pulldown_cmark::html::push_html(&mut html_output, parser);
+    pulldown_cmark::html::push_html(&mut html_output, markdown_events(content));
 
     html! {
         (DOCTYPE)
@@ -530,6 +542,37 @@ mod tests {
         let out = linkify("<script>alert(1)</script>").into_string();
         assert!(!out.contains("<script>"));
         assert!(out.contains("&lt;script&gt;"));
+    }
+
+    fn render_markdown(content: &str) -> String {
+        let mut out = String::new();
+        pulldown_cmark::html::push_html(&mut out, markdown_events(content));
+        out
+    }
+
+    #[test]
+    fn test_markdown_escapes_block_html() {
+        let out = render_markdown("<script>alert(1)</script>");
+        assert!(!out.contains("<script>"));
+        assert!(out.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_markdown_escapes_inline_html() {
+        // The shape an IRC message would take inside a copied log excerpt.
+        let out = render_markdown("[12:00] <nick> hi <img src=x onerror=alert(1)>");
+        // The payload stays visible as text; what matters is that no tag is emitted.
+        assert!(!out.contains("<img"));
+        assert!(out.contains("&lt;img"));
+        assert!(out.contains("&lt;nick&gt;"));
+    }
+
+    #[test]
+    fn test_markdown_keeps_formatting() {
+        let out = render_markdown("# Title\n\n- **bold** item\n");
+        assert!(out.contains("<h1>"));
+        assert!(out.contains("<strong>bold</strong>"));
+        assert!(out.contains("<li>"));
     }
 
     #[test]
