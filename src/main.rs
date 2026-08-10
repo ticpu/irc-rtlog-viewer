@@ -1,3 +1,6 @@
+//! Web viewer for ZNC and ISO8601 IRC logs, with live tailing and optional
+//! AI-assisted search.
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,17 +28,24 @@ struct Cli {
     config: PathBuf,
 }
 
+/// Deserialized `config.yaml`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
+    /// Listen address, `host:port`.
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Site title, shown in the sidebar and `<title>`.
     #[serde(default = "default_title")]
     pub title: String,
+    /// Maximum number of lines a plain-text search will return.
     #[serde(default = "default_search_limit")]
     pub search_limit: usize,
+    /// Roots scanned for channel directories; canonicalized at startup.
     pub logs_dirs: Vec<PathBuf>,
+    /// URL prefix when served behind a reverse proxy, normalized to `/foo` or empty.
     #[serde(default)]
     pub base_path: String,
+    /// AI search settings; the ask endpoints 404 when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai: Option<AiConfig>,
 }
@@ -75,47 +85,72 @@ impl Default for Config {
     }
 }
 
+/// Settings for the AI-backed ask feature.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AiConfig {
+    /// Anthropic API key.
     pub api_key: String,
+    /// Model id used for ask sessions.
     #[serde(default = "default_ai_model")]
     pub model: String,
+    /// Directory the generated answer documents are written to and served from.
     pub output_dir: PathBuf,
+    /// Ask sessions allowed to run at once; further requests get 503.
     #[serde(default = "default_ai_max_concurrent")]
     pub max_concurrent: usize,
+    /// Upper bound on tool-call iterations in one session.
     #[serde(default = "default_ai_max_tool_calls")]
     pub max_tool_calls: usize,
+    /// Longest accepted question, in characters.
     #[serde(default = "default_ai_max_query_len")]
     pub max_query_len: usize,
+    /// Replaces the built-in system prompt; the channel list is appended either way.
     #[serde(default)]
     pub system_prompt: Option<String>,
 }
 
+/// One directory holding a channel's logs, with the format its files use.
 #[derive(Debug, Clone)]
 pub struct ChannelDir {
+    /// Absolute path to the directory.
     pub path: PathBuf,
+    /// Line format detected from the first log file found.
     pub format: LogFormat,
 }
 
+/// A channel, possibly spanning several log directories.
 #[derive(Debug, Clone)]
 pub struct Channel {
+    /// Display name, e.g. `#chan`.
     pub name: String,
+    /// URL path components, e.g. `["testnet", "#chan"]`.
     pub path_segments: Vec<String>,
+    /// Source directories, searched in order.
     pub dirs: Vec<ChannelDir>,
 }
 
+/// Node in the channel tree; interior nodes are networks or groupings.
 #[derive(Debug, Default)]
 pub struct ChannelNode {
+    /// Set when this node is itself a channel.
     pub channel: Option<Channel>,
+    /// Child nodes keyed by path segment.
     pub children: BTreeMap<String, ChannelNode>,
 }
 
+/// Shared state handed to every request handler.
 pub struct AppState {
+    /// Parsed configuration.
     pub config: Config,
+    /// Canonicalized log roots.
     pub logs_dirs: Vec<PathBuf>,
+    /// Channel tree discovered at startup.
     pub channels: ChannelNode,
+    /// Live-tail broadcasters, keyed by channel path.
     pub sse_senders: RwLock<HashMap<String, broadcast::Sender<String>>>,
+    /// Bounds concurrent ask sessions; `None` when AI is disabled.
     pub ai_semaphore: Option<Arc<Semaphore>>,
+    /// HTTP client for the Anthropic API; `None` when AI is disabled.
     pub reqwest_client: Option<reqwest::Client>,
 }
 
