@@ -189,6 +189,22 @@ pub struct LogPageContext<'a> {
     pub base_path: &'a str,
 }
 
+const TOGGLE_EVENTS_JS: &str = r#"
+(function() {
+    var cb = document.getElementById('toggle-events');
+    var log = document.getElementById('log');
+    function apply() {
+        log.classList.toggle('hide-events', !cb.checked);
+    }
+    cb.checked = localStorage.getItem('hide-events') !== '1';
+    apply();
+    cb.addEventListener('change', function() {
+        localStorage.setItem('hide-events', cb.checked ? '0' : '1');
+        apply();
+    });
+})();
+"#;
+
 pub fn log_page(ctx: &LogPageContext) -> Markup {
     let title = ctx.title;
     let tree = ctx.tree;
@@ -264,26 +280,11 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
         log.insertAdjacentHTML('beforeend', e.data);
         if (atBottom) window.scrollTo(0, document.body.scrollHeight);
     }};
-    var cb = document.getElementById('toggle-events');
-    cb.addEventListener('change', function() {{
-        log.classList.toggle('hide-events', !cb.checked);
-    }});
 }})();
 "#)))
                 }
-            } @else {
-                script {
-                    (PreEscaped(r#"
-(function() {
-    var cb = document.getElementById('toggle-events');
-    var log = document.getElementById('log');
-    cb.addEventListener('change', function() {
-        log.classList.toggle('hide-events', !cb.checked);
-    });
-})();
-"#))
-                }
             }
+            script { (PreEscaped(TOGGLE_EVENTS_JS)) }
         },
     )
 }
