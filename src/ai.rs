@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -521,20 +522,23 @@ fn execute_done(
         .unwrap()
         .as_secs();
     let slug = slugify(title);
-    let filename = format!("{ts}-{slug}.md");
-    let path = ai_config
-        .output_dir
-        .join(&filename);
-
-    if let Err(e) = std::fs::write(&path, output_buf) {
-        eprintln!("ai: failed to write {}: {e}", path.display());
-        return format!("error writing file: {e}");
-    }
+    let stem = match write_new_output(&ai_config.output_dir, &format!("{ts}-{slug}"), output_buf) {
+        Ok(stem) => stem,
+        Err(e) => {
+            eprintln!(
+                "ai: failed to write {ts}-{slug}.md in {}: {e}",
+                ai_config
+                    .output_dir
+                    .display()
+            );
+            return format!("error writing file: {e}");
+        }
+    };
 
     let base_path = &state
         .config
         .base_path;
-    let url = format!("{base_path}/ask/output/{ts}-{slug}.html");
+    let url = format!("{base_path}/ask/output/{stem}.html");
 
     let _ = tx.send(SseEvent::Done {
         url: url.clone(),
@@ -542,6 +546,34 @@ fn execute_done(
     });
 
     format!("saved: {url}")
+}
+
+/// Writes `{stem}.md`, or `{stem}-2.md` and up when another session already took
+/// the name, and returns the stem used.
+fn write_new_output(dir: &std::path::Path, stem: &str, content: &str) -> std::io::Result<String> {
+    for n in 1..=100 {
+        let candidate = if n == 1 {
+            stem.to_owned()
+        } else {
+            format!("{stem}-{n}")
+        };
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(format!("{candidate}.md")));
+        match file {
+            Ok(mut file) => {
+                file.write_all(content.as_bytes())?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("{stem}.md and 99 numbered variants exist"),
+    ))
 }
 
 fn execute_display(input: &Value, tx: &mpsc::UnboundedSender<SseEvent>) -> String {
@@ -1038,6 +1070,22 @@ mod tests {
             }],
         );
         app_state(channels)
+    }
+
+    #[test]
+    fn same_named_outputs_do_not_overwrite_each_other() {
+        let dir = tempdir();
+        let first = write_new_output(dir.path(), "1-t", "one").unwrap();
+        let second = write_new_output(dir.path(), "1-t", "two").unwrap();
+        assert_eq!((first.as_str(), second.as_str()), ("1-t", "1-t-2"));
+        let read = |stem: &str| {
+            std::fs::read_to_string(
+                dir.path()
+                    .join(format!("{stem}.md")),
+            )
+            .unwrap()
+        };
+        assert_eq!((read(&first), read(&second)), ("one".into(), "two".into()));
     }
 
     #[test]
