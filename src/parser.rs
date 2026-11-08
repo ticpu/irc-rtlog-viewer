@@ -57,6 +57,10 @@ pub enum LineKind {
         old_nick: String,
         new_nick: String,
     },
+    /// Any other `***` server or channel notice, such as a mode change or topic.
+    Notice {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,7 +170,14 @@ fn parse_znc(line: &str) -> Option<LogLine> {
             kind: LineKind::Message { nick, text },
         })
     } else if let Some(event_rest) = rest.strip_prefix("*** ") {
-        parse_znc_event(time, event_rest)
+        parse_znc_event(time, event_rest).or_else(|| {
+            Some(LogLine {
+                time,
+                kind: LineKind::Notice {
+                    text: event_rest.to_string(),
+                },
+            })
+        })
     } else if let Some(rest) = rest.strip_prefix("* ") {
         let space = rest.find(' ')?;
         let nick = rest[..space].to_string();
@@ -245,6 +256,20 @@ fn parse_quit_or_part(time: Time, rest: &str, is_quit: bool) -> Option<LogLine> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_znc_unrecognised_notices_are_events() {
+        for line in [
+            "[15:32:11] *** Server sets mode: +nt ",
+            "[12:37:25] *** larich.oftc.net sets mode: +o py1hon",
+            "[01:02:03] *** Joins: malformed-without-host",
+        ] {
+            let parsed = parse_line(line, LogFormat::Znc).unwrap();
+            assert!(parsed.is_event(), "{line}");
+        }
+        let message = parse_line("[01:02:03] <a> *** not a notice", LogFormat::Znc).unwrap();
+        assert!(!message.is_event());
+    }
 
     #[test]
     fn test_multibyte_in_timestamp_is_rejected() {

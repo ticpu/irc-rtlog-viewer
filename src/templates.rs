@@ -126,6 +126,9 @@ pub fn render_line(line: &LogLine) -> Markup {
                         span.nick style=(nick_color_style(new_nick)) { (new_nick) }
                     }
                 },
+                LineKind::Notice { text } => {
+                    span.ev { "*** " (text) }
+                },
             }
         }
     }
