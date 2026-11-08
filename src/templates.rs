@@ -137,9 +137,8 @@ fn render_channel_tree(node: &ChannelNode, parent_path: &str, base_path: &str) -
                     } else {
                         format!("{parent_path}/{name}")
                     };
-                    @let encoded_path = child_path.replace('#', "%23");
                     @if let Some(channel) = &child.channel {
-                        a href=(format!("{base_path}/{}/today", encoded_path)) { (&channel.name) }
+                        a href=(format!("{base_path}/{}/today", channel.url_path())) { (&channel.name) }
                     } @else {
                         span.tree-label { (name) }
                     }
@@ -216,10 +215,7 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
     let is_today = ctx.is_today;
     let ai_enabled = ctx.ai_enabled;
     let bp = ctx.base_path;
-    let encoded = channel
-        .path_segments
-        .join("/")
-        .replace('#', "%23");
+    let encoded = channel.url_path();
     page(
         title,
         tree,
@@ -297,10 +293,7 @@ pub fn search_page(
     results: &[(String, LogLine)],
     base_path: &str,
 ) -> Markup {
-    let encoded = channel
-        .path_segments
-        .join("/")
-        .replace('#', "%23");
+    let encoded = channel.url_path();
     page(
         title,
         tree,
@@ -361,10 +354,7 @@ pub fn ask_page(
     base_path: &str,
     max_query_len: usize,
 ) -> Markup {
-    let encoded = channel
-        .path_segments
-        .join("/")
-        .replace('#', "%23");
+    let encoded = channel.url_path();
     page(
         title,
         tree,
@@ -382,7 +372,7 @@ pub fn ask_page(
                     strong { (&channel.name) }
                     " by default, and can search other channels if you name them in your question."
                 }
-                form id="ask-form" {
+                form id="ask-form" data-stream=(format!("{base_path}/{encoded}/ask/stream")) {
                     input type="text" name="q"
                         placeholder="e.g. what was decided about the router config?"
                         maxlength=(max_query_len) autocomplete="off";
@@ -393,20 +383,20 @@ pub fn ask_page(
                 div id="ask-log" {}
             }
             script {
-                (PreEscaped(format!(r#"
-(function() {{
+                (PreEscaped(r#"
+(function() {
     var form = document.getElementById('ask-form');
     var log = document.getElementById('ask-log');
     var links = document.getElementById('ask-links');
     var result = document.getElementById('ask-result');
     var btn = form.querySelector('button');
     var input = form.querySelector('input');
-    function setBusy(busy) {{
+    function setBusy(busy) {
         btn.disabled = busy;
         input.disabled = busy;
         btn.textContent = busy ? 'working…' : 'ask AI';
-    }}
-    form.onsubmit = function(e) {{
+    }
+    form.onsubmit = function(e) {
         e.preventDefault();
         var q = input.value.trim();
         if (!q) return;
@@ -416,43 +406,43 @@ pub fn ask_page(
         links.innerHTML = '';
         result.style.display = 'none';
         result.innerHTML = '';
-        var src = new EventSource('{base_path}/{encoded}/ask/stream?q=' + encodeURIComponent(q));
-        src.addEventListener('display', function(e) {{
+        var src = new EventSource(form.dataset.stream + '?q=' + encodeURIComponent(q));
+        src.addEventListener('display', function(e) {
             var d = JSON.parse(e.data);
             var div = document.createElement('div');
             div.className = 'ask-display';
             div.textContent = d.text;
             log.prepend(div);
-        }});
-        src.addEventListener('tool_call', function(e) {{
+        });
+        src.addEventListener('tool_call', function(e) {
             var d = JSON.parse(e.data);
             var div = document.createElement('div');
             div.className = 'ask-tool';
             div.textContent = '> ' + d.name + '(' + d.input + ')';
             log.prepend(div);
-        }});
-        src.addEventListener('tool_result', function(e) {{
+        });
+        src.addEventListener('tool_result', function(e) {
             var d = JSON.parse(e.data);
             var pre = document.createElement('pre');
             pre.className = 'ask-result-preview';
             pre.textContent = d.output;
             log.prepend(pre);
-            requestAnimationFrame(function() {{
-                if (pre.scrollHeight > pre.clientHeight) {{
+            requestAnimationFrame(function() {
+                if (pre.scrollHeight > pre.clientHeight) {
                     var btn = document.createElement('a');
                     btn.className = 'ask-expand';
                     btn.textContent = 'expand';
                     btn.href = '#';
-                    btn.onclick = function(ev) {{
+                    btn.onclick = function(ev) {
                         ev.preventDefault();
                         var expanded = pre.classList.toggle('expanded');
                         btn.textContent = expanded ? 'collapse' : 'expand';
-                    }};
+                    };
                     pre.before(btn);
-                }}
-            }});
-        }});
-        src.addEventListener('done', function(e) {{
+                }
+            });
+        });
+        src.addEventListener('done', function(e) {
             var d = JSON.parse(e.data);
             links.style.display = 'block';
             links.innerHTML = '<a href="' + d.url + '">' + d.url + '</a>';
@@ -460,8 +450,8 @@ pub fn ask_page(
             result.style.display = 'block';
             src.close();
             setBusy(false);
-        }});
-        src.addEventListener('ask_error', function(e) {{
+        });
+        src.addEventListener('ask_error', function(e) {
             var d = JSON.parse(e.data);
             var div = document.createElement('div');
             div.className = 'ask-error';
@@ -469,14 +459,14 @@ pub fn ask_page(
             log.prepend(div);
             src.close();
             setBusy(false);
-        }});
-        src.onerror = function() {{
+        });
+        src.onerror = function() {
             src.close();
             setBusy(false);
-        }};
-    }};
-}})();
-"#)))
+        };
+    };
+})();
+"#.to_string()))
             }
         },
     )

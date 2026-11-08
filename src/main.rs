@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use clap::Parser;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::broadcast;
@@ -128,6 +129,25 @@ pub struct Channel {
     /// Source directories, searched in order.
     pub dirs: Vec<ChannelDir>,
 }
+
+impl Channel {
+    /// URL path of the channel, without base path or leading `/`.
+    pub fn url_path(&self) -> String {
+        self.path_segments
+            .iter()
+            .map(|s| utf8_percent_encode(s, PATH_SEGMENT).to_string())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
+/// Everything but RFC 3986 unreserved characters, so an encoded segment is
+/// also inert inside an HTML attribute or a JS string.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// Node in the channel tree; interior nodes are networks or groupings.
 #[derive(Debug, Default)]

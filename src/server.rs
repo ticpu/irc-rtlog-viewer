@@ -8,6 +8,7 @@ use axum::http::{StatusCode, Uri, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
+use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -77,13 +78,19 @@ async fn wildcard(
     uri: Uri,
     Query(search): Query<SearchQuery>,
 ) -> Response {
-    let path = percent_decode(
-        uri.path()
-            .trim_start_matches('/'),
-    );
-    let segments: Vec<&str> = path
+    // Split before decoding so an encoded %2F stays inside its segment.
+    let decoded: Result<Vec<_>, _> = uri
+        .path()
         .split('/')
         .filter(|s| !s.is_empty())
+        .map(|s| percent_decode_str(s).decode_utf8())
+        .collect();
+    let Ok(decoded) = decoded else {
+        return (StatusCode::BAD_REQUEST, "path is not valid UTF-8").into_response();
+    };
+    let segments: Vec<&str> = decoded
+        .iter()
+        .map(|s| s.as_ref())
         .collect();
 
     if segments.is_empty() {
@@ -137,10 +144,7 @@ async fn wildcard(
                     let bp = &state
                         .config
                         .base_path;
-                    let encoded = channel
-                        .path_segments
-                        .join("/")
-                        .replace('#', "%23");
+                    let encoded = channel.url_path();
                     let date = latest_date(&channel);
                     Redirect::temporary(&format!("{bp}/{encoded}/{date}")).into_response()
                 }
@@ -173,10 +177,7 @@ async fn wildcard(
         let bp = &state
             .config
             .base_path;
-        let encoded = channel
-            .path_segments
-            .join("/")
-            .replace('#', "%23");
+        let encoded = channel.url_path();
         let date = latest_date(channel);
         return Redirect::temporary(&format!("{bp}/{encoded}/{date}")).into_response();
     }
@@ -226,26 +227,6 @@ fn epoch_days_to_date(days: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn percent_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) =
-                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                result.push(byte as char);
-                i += 3;
-                continue;
-            }
-        }
-        result.push(bytes[i] as char);
-        i += 1;
-    }
-    result
 }
 
 fn find_channel<'a>(node: &'a crate::ChannelNode, segments: &[&str]) -> Option<&'a crate::Channel> {
@@ -691,7 +672,7 @@ async fn serve_ask_output(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
 
     use axum::body::Body;
     use axum::http::Request;
@@ -701,21 +682,34 @@ mod tests {
     use super::*;
     use crate::{Channel, ChannelNode};
 
+    const CHANNELS: &[&[&str]] = &[
+        &["OFTC", "#bcache"],
+        &["net", "#café"],
+        &["net", "#a b'\"<"],
+    ];
+
     fn state() -> Arc<AppState> {
-        let channel = ChannelNode {
-            channel: Some(Channel {
-                name: "#bcache".into(),
-                path_segments: vec!["OFTC".into(), "#bcache".into()],
-                dirs: Vec::new(),
-            }),
-            children: BTreeMap::new(),
-        };
-        let mut oftc = ChannelNode::default();
-        oftc.children
-            .insert("#bcache".into(), channel);
         let mut root = ChannelNode::default();
-        root.children
-            .insert("OFTC".into(), oftc);
+        for segments in CHANNELS {
+            let mut node = &mut root;
+            for seg in *segments {
+                node = node
+                    .children
+                    .entry(seg.to_string())
+                    .or_default();
+            }
+            node.channel = Some(Channel {
+                name: segments
+                    .last()
+                    .unwrap()
+                    .to_string(),
+                path_segments: segments
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                dirs: Vec::new(),
+            });
+        }
         Arc::new(AppState {
             config: serde_yaml::from_str("logs_dirs: []").unwrap(),
             logs_dirs: Vec::new(),
@@ -768,6 +762,55 @@ mod tests {
     async fn today_resolves_with_trailing_slash() {
         let (status, _) = get_status("/OFTC/%23bcache/today/").await;
         assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    }
+
+    #[tokio::test]
+    async fn every_channel_round_trips_through_its_url() {
+        let state = state();
+        let mut stack = vec![&state.channels];
+        let mut seen = 0;
+        while let Some(node) = stack.pop() {
+            stack.extend(
+                node.children
+                    .values(),
+            );
+            let Some(channel) = &node.channel else {
+                continue;
+            };
+            seen += 1;
+            let url = format!("/{}", channel.url_path());
+            assert!(
+                url.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._~%/".contains(&b)),
+                "{url}"
+            );
+            let (status, location) = get_status(&url).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "{url}");
+            let location = location.unwrap();
+            assert!(
+                location.starts_with(&format!("{url}/")),
+                "{url} -> {location}"
+            );
+        }
+        assert_eq!(seen, CHANNELS.len());
+    }
+
+    #[tokio::test]
+    async fn escape_at_end_of_path_is_decoded() {
+        let (status, _) = get_status("/OFTC/%23bcach%65").await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    }
+
+    #[tokio::test]
+    async fn encoded_slash_stays_in_its_segment() {
+        let (status, _) = get_status("/OFTC%2F%23bcache").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_in_path_is_rejected() {
+        let (status, _) = get_status("/OFTC/%FF").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
