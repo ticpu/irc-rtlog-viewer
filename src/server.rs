@@ -417,6 +417,10 @@ pub fn resolve_log_path(
     channel: &crate::Channel,
     date: &str,
 ) -> Option<(std::path::PathBuf, LogFormat)> {
+    // Callers include the AI tools, whose date is model output.
+    if !looks_like_date(date) {
+        return None;
+    }
     for dir in &channel.dirs {
         let plain = dir
             .path

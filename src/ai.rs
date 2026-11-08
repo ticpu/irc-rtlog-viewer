@@ -1015,7 +1015,79 @@ pub fn parse_line_spec(spec: &str) -> Result<BTreeSet<usize>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use tokio::sync::RwLock;
+
     use super::*;
+    use crate::parser::LogFormat;
+    use crate::{ChannelDir, ChannelNode};
+
+    /// A `#c` channel whose directory has a `secret1.log` sibling.
+    fn state_with_secret_sibling(root: &std::path::Path) -> AppState {
+        let dir = root.join("#c");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("2026-01-01.log"),
+            "2026-01-01T00:00:00Z <a> SECRET? no\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("secret1.log"),
+            "2026-01-01T00:00:00Z <a> SECRET\n",
+        )
+        .unwrap();
+        let mut channels = ChannelNode::default();
+        channels
+            .children
+            .entry("#c".into())
+            .or_default()
+            .channel = Some(Channel {
+            name: "#c".into(),
+            path_segments: vec!["#c".into()],
+            dirs: vec![ChannelDir {
+                path: dir,
+                format: LogFormat::Iso8601,
+            }],
+        });
+        AppState {
+            config: serde_yaml::from_str("logs_dirs: []").unwrap(),
+            logs_dirs: Vec::new(),
+            channels,
+            sse_senders: RwLock::new(HashMap::new()),
+            ai_semaphore: None,
+            reqwest_client: None,
+        }
+    }
+
+    #[test]
+    fn tools_cannot_read_outside_the_channel_dir() {
+        let root = tempfile::Builder::new()
+            .prefix("test-ai-")
+            .tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target"))
+            .unwrap();
+        let state = state_with_secret_sibling(root.path());
+        let date = "../secret1";
+        let control = execute_search(
+            &json!({"pattern": "SECRET", "channel": "#c", "date": "2026-01-01"}),
+            &state,
+        );
+        assert!(control.contains("SECRET? no"), "{control}");
+
+        let out = execute_search(
+            &json!({"pattern": "SECRET", "channel": "#c", "date": date}),
+            &state,
+        );
+        assert!(!out.contains("<a> SECRET\n"), "{out}");
+
+        let mut buf = String::new();
+        execute_copy(
+            &json!({"channel": "#c", "date": date, "lines": "1"}),
+            &state,
+            &mut buf,
+        );
+        assert!(!buf.contains("<a> SECRET\n"), "{buf}");
+    }
 
     #[test]
     fn test_slugify_basic() {
