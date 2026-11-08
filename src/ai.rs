@@ -484,7 +484,7 @@ fn execute_copy(input: &Value, state: &AppState, output_buf: &mut String) -> Str
     }
 
     if output_buf.len() > 100_000 {
-        output_buf.truncate(100_000);
+        output_buf.truncate(output_buf.floor_char_boundary(100_000));
         return format!("copied {copied} lines (output buffer truncated to 100KB)");
     }
 
@@ -505,7 +505,7 @@ fn execute_output(input: &Value, output_buf: &mut String) -> String {
     output_buf.push('\n');
 
     if output_buf.len() > 100_000 {
-        output_buf.truncate(100_000);
+        output_buf.truncate(output_buf.floor_char_boundary(100_000));
         return "appended (output buffer truncated to 100KB)".into();
     }
 
@@ -916,7 +916,7 @@ fn summarize_input(tool_name: &str, input: &Value) -> String {
             let text = input["text"]
                 .as_str()
                 .unwrap_or("");
-            let preview = if text.len() > 60 { &text[..60] } else { text };
+            let preview = &text[..text.floor_char_boundary(60)];
             format!("{preview:?}")
         }
         "done" => {
@@ -929,7 +929,7 @@ fn summarize_input(tool_name: &str, input: &Value) -> String {
             let text = input["text"]
                 .as_str()
                 .unwrap_or("");
-            let preview = if text.len() > 80 { &text[..80] } else { text };
+            let preview = &text[..text.floor_char_boundary(80)];
             preview.to_string()
         }
         "abort" => String::new(),
@@ -1087,6 +1087,22 @@ mod tests {
             &mut buf,
         );
         assert!(!buf.contains("<a> SECRET\n"), "{buf}");
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        let text = format!("{}é", "a".repeat(59));
+        assert!(summarize_input("output", &json!({"text": text})).starts_with("\"aaa"));
+        let text = format!("{}é", "a".repeat(79));
+        assert_eq!(
+            summarize_input("display", &json!({"text": text})),
+            "a".repeat(79)
+        );
+
+        let text = format!("{}é", "a".repeat(99_999));
+        let mut buf = String::new();
+        execute_output(&json!({"text": text}), &mut buf);
+        assert_eq!(buf, "a".repeat(99_999));
     }
 
     #[test]
