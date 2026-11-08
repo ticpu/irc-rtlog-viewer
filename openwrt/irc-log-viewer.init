@@ -19,6 +19,8 @@ start_service() {
 
 	procd_add_jail irc-log-viewer log
 	procd_add_jail_mount "$CONF"
+	# The Anthropic client verifies TLS against the system trust store.
+	procd_add_jail_mount /etc/ssl/certs
 
 	# Mount log dirs (read-only) and output dir (read-write) from YAML config
 	for dir in $(awk '/^logs_dirs:/{p=1;next} p && /^[^-]/{exit} p{print $2}' "$CONF"); do

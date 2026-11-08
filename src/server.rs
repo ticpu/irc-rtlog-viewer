@@ -1224,6 +1224,7 @@ mod limit_tests {
         );
         let mut state = app_state(channels, &yaml);
         state.api_url = fake_api(Arc::clone(&hits)).await;
+        crate::install_crypto_provider();
         // Its own client: the proxy variables of the test environment must not
         // route a loopback request.
         state.reqwest_client = Some(

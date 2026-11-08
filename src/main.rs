@@ -249,6 +249,7 @@ pub struct AppState {
 }
 
 fn main() {
+    install_crypto_provider();
     // The OpenWrt init caps address space at 250 MB; tokio's default of 512
     // blocking threads with 2 MB stacks could reserve four times that.
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -260,6 +261,17 @@ fn main() {
             std::process::exit(1);
         });
     runtime.block_on(run());
+}
+
+/// Selects ring for rustls: reqwest is built without a provider because its
+/// default, aws-lc-rs, does not link for aarch64-musl with the Makefile's gcc.
+pub fn install_crypto_provider() {
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        eprintln!("tls: a rustls crypto provider is already installed, keeping it");
+    }
 }
 
 async fn run() {
@@ -340,7 +352,14 @@ async fn run() {
             );
             (
                 Some(Arc::new(Semaphore::new(ai.max_concurrent))),
-                Some(reqwest::Client::new()),
+                Some(
+                    reqwest::Client::builder()
+                        .build()
+                        .unwrap_or_else(|e| {
+                            eprintln!("ai: cannot build the HTTPS client: {e}");
+                            std::process::exit(1);
+                        }),
+                ),
             )
         }
         None => (None, None),
