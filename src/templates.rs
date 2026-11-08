@@ -22,6 +22,9 @@ pub fn linkify(text: &str) -> Markup {
     let mut last = 0;
 
     for (i, _) in text.match_indices("http") {
+        if i < last {
+            continue;
+        }
         let rest = &text[i..];
         let scheme_end = if rest.starts_with("https://") {
             8
@@ -526,6 +529,15 @@ mod tests {
         assert!(out.contains(r#"<a href="https://example.com/""#));
         assert!(out.contains("see "));
         assert!(out.contains(" here"));
+    }
+
+    #[test]
+    fn test_linkify_url_containing_http() {
+        let out = linkify("x http://ahttp://b y").into_string();
+        assert_eq!(
+            out,
+            r#"x <a href="http://ahttp://b" target="_blank" rel="noopener">http://ahttp://b</a> y"#
+        );
     }
 
     #[test]
