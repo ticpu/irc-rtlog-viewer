@@ -3,12 +3,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Query, State};
+use std::net::{IpAddr, SocketAddr};
+
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::HeaderMap;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::middleware::map_response;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
+use cookie::{Cookie, SameSite};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use tokio::sync::broadcast;
@@ -16,6 +20,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
+use crate::limits;
 use crate::parser::{LogFormat, parse_line};
 use crate::search::search_channel;
 use crate::templates;
@@ -108,9 +113,14 @@ struct SearchQuery {
 
 async fn wildcard(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     uri: Uri,
     Query(search): Query<SearchQuery>,
 ) -> Response {
+    let addr = state
+        .limits
+        .client_addr(peer, &headers);
     // Split before decoding so an encoded %2F stays inside its segment.
     let decoded: Result<Vec<_>, _> = uri
         .path()
@@ -144,7 +154,7 @@ async fn wildcard(
             let query = search
                 .q
                 .unwrap_or_default();
-            return serve_ask_stream(state, channel, &query)
+            return serve_ask_stream(state, channel, &query, addr, &headers)
                 .await
                 .into_response();
         }
@@ -188,9 +198,9 @@ async fn wildcard(
                     let query = search
                         .q
                         .unwrap_or_default();
-                    off_runtime(move || serve_search(&state, &channel, &query)).await
+                    search_with_limits(state, channel, query, addr).await
                 }
-                "ask" => serve_ask_page(&state, &channel).into_response(),
+                "ask" => serve_ask_page(&state, &channel, &headers),
                 "raw" => {
                     let date = segments[segments.len() - 2].to_owned();
                     off_runtime(move || serve_raw(&channel, &date)).await
@@ -215,6 +225,64 @@ async fn wildcard(
     }
 
     (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
+/// Applies the search page's limits, then runs the search on the blocking pool.
+async fn search_with_limits(
+    state: Arc<AppState>,
+    channel: crate::Channel,
+    query: String,
+    addr: IpAddr,
+) -> Response {
+    let max_len = state
+        .config
+        .search
+        .max_query_len;
+    if query
+        .chars()
+        .count()
+        > max_len
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("query too long, limit is {max_len} characters"),
+        )
+            .into_response();
+    }
+    // The slot is taken before the rate token so a busy refusal costs nothing.
+    let Ok(slot) = Arc::clone(
+        &state
+            .limits
+            .search_slots,
+    )
+    .try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "5")],
+            "search is busy, try again in a few seconds",
+        )
+            .into_response();
+    };
+    if let Err(wait) = state
+        .limits
+        .charge_search(addr)
+    {
+        let secs = wait
+            .as_secs()
+            .max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, secs.to_string())],
+            format!("too many searches, try again in {secs} s"),
+        )
+            .into_response();
+    }
+    off_runtime(move || {
+        let response = serve_search(&state, &channel, &query);
+        drop(slot);
+        response
+    })
+    .await
 }
 
 /// Runs file-reading work on the blocking pool: the runtime has one thread, which
@@ -337,6 +405,10 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
         base_path: &state
             .config
             .base_path,
+        search_max_len: state
+            .config
+            .search
+            .max_query_len,
     })
     .into_response();
     let cc = if is_today {
@@ -360,6 +432,10 @@ fn serve_search(state: &AppState, channel: &crate::Channel, query: &str) -> Resp
         state
             .config
             .search_limit,
+        state
+            .config
+            .search
+            .max_days,
     );
     let mut resp = templates::search_page(
         &state
@@ -372,6 +448,10 @@ fn serve_search(state: &AppState, channel: &crate::Channel, query: &str) -> Resp
         &state
             .config
             .base_path,
+        state
+            .config
+            .search
+            .max_query_len,
     )
     .into_response();
     resp.headers_mut()
@@ -517,7 +597,7 @@ pub fn channel_dates(channel: &crate::Channel) -> Vec<String> {
         .collect()
 }
 
-fn serve_ask_page(state: &AppState, channel: &crate::Channel) -> Response {
+fn serve_ask_page(state: &AppState, channel: &crate::Channel, headers: &HeaderMap) -> Response {
     let Some(ai_config) = &state
         .config
         .ai
@@ -543,10 +623,52 @@ fn serve_ask_page(state: &AppState, channel: &crate::Channel) -> Response {
                 .parse()
                 .unwrap(),
         );
+    if limits::client_id(headers).is_none() {
+        let id = match limits::new_client_id() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("ask: cannot generate a client id: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cannot generate a client id",
+                )
+                    .into_response();
+            }
+        };
+        let bp = &state
+            .config
+            .base_path;
+        let cookie = Cookie::build((limits::ASK_COOKIE, id))
+            .path(if bp.is_empty() { "/" } else { bp.as_str() })
+            .max_age(cookie::time::Duration::days(365))
+            .http_only(true)
+            .same_site(SameSite::Strict)
+            .build();
+        match HeaderValue::from_str(&cookie.to_string()) {
+            Ok(v) => {
+                resp.headers_mut()
+                    .insert(header::SET_COOKIE, v);
+            }
+            Err(e) => {
+                eprintln!("ask: cookie for base path {bp:?} is not a valid header: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid base_path for a cookie",
+                )
+                    .into_response();
+            }
+        }
+    }
     resp
 }
 
-async fn serve_ask_stream(state: Arc<AppState>, channel: crate::Channel, query: &str) -> Response {
+async fn serve_ask_stream(
+    state: Arc<AppState>,
+    channel: crate::Channel,
+    query: &str,
+    addr: IpAddr,
+    headers: &HeaderMap,
+) -> Response {
     if state
         .config
         .ai
@@ -579,6 +701,11 @@ async fn serve_ask_stream(state: Arc<AppState>, channel: crate::Channel, query: 
             .into_response();
     }
 
+    // EventSource cannot read a status code, so refusals from here on reach the
+    // page as an ask_error event.
+    let Some(client_id) = limits::client_id(headers) else {
+        return sse_error("missing ask_id cookie, reload the page".into());
+    };
     let semaphore = state
         .ai_semaphore
         .as_ref()
@@ -589,18 +716,24 @@ async fn serve_ask_stream(state: Arc<AppState>, channel: crate::Channel, query: 
     {
         Ok(p) => p,
         Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "AI search is busy, try again later",
-            )
-                .into_response();
+            return sse_error("AI search is busy, try again later".into());
         }
+    };
+    if let Err(refusal) = state
+        .limits
+        .charge_ask(&client_id, addr)
+    {
+        return sse_error(refusal.to_string());
+    }
+    let client = crate::ai::AskClient {
+        id: client_id,
+        addr,
     };
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::ai::SseEvent>();
 
     tokio::spawn(async move {
-        crate::ai::run_ai_session(query, channel, state, tx).await;
+        crate::ai::run_ai_session(query, channel, state, client, tx).await;
         drop(permit);
     });
 
@@ -641,6 +774,14 @@ async fn serve_ask_stream(state: Arc<AppState>, channel: crate::Channel, query: 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// A one-event stream carrying `msg` as an ask_error.
+fn sse_error(msg: String) -> Response {
+    let event = Event::default()
+        .event("ask_error")
+        .data(serde_json::json!({"error": msg}).to_string());
+    Sse::new(tokio_stream::once(Ok::<_, std::convert::Infallible>(event))).into_response()
 }
 
 async fn serve_ask_output(
@@ -724,8 +865,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::test_support::{add_channel, app_state, tempdir};
+    use crate::test_support::{add_channel, app, app_state, stalled_channel, tempdir};
     use crate::{ChannelDir, ChannelNode};
+
+    const PEER: &str = "192.0.2.1:4000";
 
     const CHANNELS: &[&[&str]] = &[
         &["OFTC", "#bcache"],
@@ -738,12 +881,11 @@ mod tests {
         for segments in CHANNELS {
             add_channel(&mut root, segments, Vec::new());
         }
-        Arc::new(app_state(root))
+        Arc::new(app_state(root, "logs_dirs: []"))
     }
 
     async fn get_status(uri: &str) -> (StatusCode, Option<String>) {
-        let resp = router()
-            .with_state(state())
+        let resp = app(state(), PEER)
             .oneshot(
                 Request::get(uri)
                     .body(Body::empty())
@@ -851,7 +993,7 @@ mod tests {
             format: LogFormat::Iso8601,
         }];
         add_channel(&mut channels, &["#c"], dirs);
-        let app = router().with_state(Arc::new(app_state(channels)));
+        let app = app(Arc::new(app_state(channels, "logs_dirs: []")), PEER);
         for uri in [
             "/%23c/search?q=needle",
             "/%23c/2026-01-01",
@@ -877,35 +1019,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalled_search_does_not_block_other_requests() {
-        let root = tempdir();
-        let fifo = root
-            .path()
-            .join("2026-01-01.log");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let mut channels = ChannelNode::default();
-        let dirs = vec![ChannelDir {
-            path: root
-                .path()
-                .to_owned(),
-            format: LogFormat::Iso8601,
-        }];
-        add_channel(&mut channels, &["#c"], dirs);
-        let app = router().with_state(Arc::new(app_state(channels)));
-
-        // Opening the FIFO blocks the search until this thread writes; on timeout it
-        // writes anyway so a blocked runtime fails the test instead of hanging it.
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let writer = std::thread::spawn(move || {
-            let timed_out = released
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .is_err();
-            std::fs::write(&fifo, "2026-01-01T00:00:00Z <a> x\n").unwrap();
-            timed_out
-        });
+        let (_root, channels, release, writer) = stalled_channel();
+        let app = app(Arc::new(app_state(channels, "logs_dirs: []")), PEER);
 
         let search = tokio::spawn(
             app.clone()
@@ -958,11 +1073,11 @@ mod tests {
             format: LogFormat::Iso8601,
         }];
         add_channel(&mut channels, &["#c"], dirs);
-        let mut state = app_state(channels);
-        state
-            .config
-            .ai = Some(serde_yaml::from_str("{api_key: k, output_dir: /nonexistent}").unwrap());
-        let app = router().with_state(Arc::new(state));
+        let state = app_state(
+            channels,
+            "{logs_dirs: [], ai: {api_key: k, output_dir: /nonexistent}}",
+        );
+        let app = app(Arc::new(state), PEER);
         let inline = regex::Regex::new(r"<script>|<script [^>]*>[^<]|\son[a-z]+=").unwrap();
         for uri in [
             "/",
@@ -1000,5 +1115,299 @@ mod tests {
     async fn unknown_channel_is_not_found() {
         let (status, _) = get_status("/OFTC/%23nope/").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::post;
+    use tokio::sync::Semaphore;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::test_support::{add_channel, app, app_state, stalled_channel, tempdir};
+    use crate::{ChannelDir, ChannelNode};
+
+    const PEER: &str = "192.0.2.1:4000";
+
+    /// A `#c` channel with one log file per `(date, line)`.
+    fn channel_with_logs(days: &[(&str, &str)]) -> (tempfile::TempDir, ChannelNode) {
+        let root = tempdir();
+        for (date, text) in days {
+            std::fs::write(
+                root.path()
+                    .join(format!("{date}.log")),
+                format!("{date}T00:00:00Z <a> {text}\n"),
+            )
+            .unwrap();
+        }
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: root
+                .path()
+                .to_owned(),
+            format: LogFormat::Iso8601,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        (root, channels)
+    }
+
+    async fn get(
+        app: &Router,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut req = Request::get(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                req.body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let headers = resp
+            .headers()
+            .clone();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// Stands in for the Messages API, always asking for one more display call.
+    async fn fake_api(hits: Arc<AtomicUsize>) -> String {
+        let api = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        serde_json::json!({
+                        "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "id": "t", "name": "display", "input": {"text": "x"}}],
+                    }).to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        tokio::spawn(async move { axum::serve(listener, api).await });
+        format!("http://{addr}/v1/messages")
+    }
+
+    #[tokio::test]
+    async fn ask_sessions_stop_at_the_client_then_the_address_budget() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (_logs, channels) = channel_with_logs(&[("2026-01-01", "hi")]);
+        let out = tempdir();
+        let yaml = format!(
+            "{{logs_dirs: [], ai: {{api_key: k, output_dir: '{}', requests_per_day_per_client: 3, \
+             requests_per_day_per_ip: 5}}}}",
+            out.path()
+                .display()
+        );
+        let mut state = app_state(channels, &yaml);
+        state.api_url = fake_api(Arc::clone(&hits)).await;
+        // Its own client: the proxy variables of the test environment must not
+        // route a loopback request.
+        state.reqwest_client = Some(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+        );
+        state.ai_semaphore = Some(Arc::new(Semaphore::new(1)));
+        let app = app(Arc::new(state), PEER);
+        let a = format!("{}=000000000000000000000000000000aa", limits::ASK_COOKIE);
+        let b = format!("{}=000000000000000000000000000000bb", limits::ASK_COOKIE);
+        let ask = "/%23c/ask/stream?q=x";
+
+        let (_, _, body) = get(&app, ask, &[("cookie", &a)]).await;
+        assert!(body.contains("used up for this browser"), "{body}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        let (_, _, body) = get(&app, ask, &[("cookie", &b)]).await;
+        assert!(body.contains("used up for your address"), "{body}");
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+
+        let (_, _, body) = get(&app, ask, &[]).await;
+        assert!(body.contains("missing ask_id cookie"), "{body}");
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn ask_page_hands_out_the_cookie_once() {
+        let (_logs, channels) = channel_with_logs(&[]);
+        let state = app_state(
+            channels,
+            "{logs_dirs: [], base_path: /irc, ai: {api_key: k, output_dir: /x}}",
+        );
+        let app = app(Arc::new(state), PEER);
+        let (status, headers, _) = get(&app, "/%23c/ask", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let cookie = headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        for attr in ["HttpOnly", "SameSite=Strict", "Path=/irc", "Max-Age="] {
+            assert!(cookie.contains(attr), "{cookie}");
+        }
+        let pair = cookie
+            .split(';')
+            .next()
+            .unwrap();
+        let (_, headers, _) = get(&app, "/%23c/ask", &[("cookie", pair)]).await;
+        assert!(
+            headers
+                .get(header::SET_COOKIE)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn search_rejects_long_queries() {
+        let (_logs, channels) = channel_with_logs(&[]);
+        let app = app(
+            Arc::new(app_state(
+                channels,
+                "{logs_dirs: [], search: {max_query_len: 5}}",
+            )),
+            PEER,
+        );
+        let (status, _, _) = get(&app, "/%23c/search?q=%C3%A9%C3%A9%C3%A9%C3%A9%C3%A9", &[]).await;
+        assert_eq!(status, StatusCode::OK, "five two-byte characters fit");
+        let (status, _, _) = get(&app, "/%23c/search?q=abcdef", &[]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn search_rate_is_per_client_address() {
+        let (_logs, channels) = channel_with_logs(&[]);
+        let state = Arc::new(app_state(
+            channels,
+            "{logs_dirs: [], search: {per_ip_per_minute: 2}}",
+        ));
+        let direct = app(Arc::clone(&state), PEER);
+        let proxied = app(Arc::clone(&state), "[::1]:5000");
+        let q = "/%23c/search?q=x";
+        for _ in 0..2 {
+            assert_eq!(
+                get(&direct, q, &[])
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        let (status, headers, _) = get(&direct, q, &[]).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.contains_key(header::RETRY_AFTER));
+
+        // Through the trusted proxy, X-Real-IP picks the bucket.
+        let real = [("x-real-ip", "192.0.2.1")];
+        assert_eq!(
+            get(&proxied, q, &real)
+                .await
+                .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let other = [("x-real-ip", "198.51.100.7")];
+        assert_eq!(
+            get(&proxied, q, &other)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // From an untrusted peer the header is ignored.
+        assert_eq!(
+            get(&direct, q, &other)
+                .await
+                .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn search_stops_at_the_day_bound() {
+        let (_logs, channels) =
+            channel_with_logs(&[("2026-01-01", "needle"), ("2026-01-02", "hay")]);
+        let app = app(
+            Arc::new(app_state(
+                channels,
+                "{logs_dirs: [], search: {max_days: 1}}",
+            )),
+            PEER,
+        );
+        let (_, _, body) = get(&app, "/%23c/search?q=needle", &[]).await;
+        assert!(body.contains("no results"), "{body}");
+        assert!(body.contains("Searched the newest 1 days"), "{body}");
+        let (_, _, body) = get(&app, "/%23c/search?q=hay", &[]).await;
+        assert!(body.contains("Searched the newest 1 days"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_beyond_the_concurrency_limit_is_busy() {
+        let (_root, channels, release, writer) = stalled_channel();
+        let state = Arc::new(app_state(
+            channels,
+            "{logs_dirs: [], search: {max_concurrent: 1}}",
+        ));
+        let app = app(Arc::clone(&state), PEER);
+
+        // The first search holds the only slot while it blocks opening the FIFO.
+        let stalled = tokio::spawn({
+            let app = app.clone();
+            async move {
+                get(&app, "/%23c/search?q=x", &[])
+                    .await
+                    .0
+            }
+        });
+        let slots = &state
+            .limits
+            .search_slots;
+        for _ in 0..10_000 {
+            if slots.available_permits() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "first search never took the slot"
+        );
+        let (status, headers, _) = get(&app, "/%23c/search?q=y", &[]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(headers.contains_key(header::RETRY_AFTER));
+
+        let _ = release.send(());
+        assert!(
+            !writer
+                .join()
+                .unwrap(),
+            "the stalled search was released by the watchdog"
+        );
+        assert_eq!(
+            stalled
+                .await
+                .unwrap(),
+            StatusCode::OK
+        );
     }
 }

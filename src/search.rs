@@ -2,13 +2,30 @@ use crate::Channel;
 use crate::parser::{LogLine, parse_line};
 use crate::server::{channel_dates, read_log_file, resolve_log_path};
 
-pub fn search_channel(channel: &Channel, query: &str, limit: usize) -> Vec<(String, LogLine)> {
+pub struct SearchResults {
+    /// Matching lines with their date, newest day first.
+    pub lines: Vec<(String, LogLine)>,
+    /// Set to the day bound when older days were left unscanned.
+    pub stopped_at_days: Option<usize>,
+}
+
+/// Case-insensitive substring search over the newest `max_days` days.
+pub fn search_channel(
+    channel: &Channel,
+    query: &str,
+    limit: usize,
+    max_days: usize,
+) -> SearchResults {
     let query_lower = query.to_lowercase();
-    let mut results = Vec::new();
+    let mut lines = Vec::new();
     let mut dates = channel_dates(channel);
     dates.reverse();
+    let stopped_at_days = (dates.len() > max_days).then_some(max_days);
 
-    for date in dates {
+    for date in dates
+        .into_iter()
+        .take(max_days)
+    {
         let Some((path, format)) = resolve_log_path(channel, &date) else {
             continue;
         };
@@ -22,14 +39,20 @@ pub fn search_channel(channel: &Channel, query: &str, limit: usize) -> Vec<(Stri
                 .contains(&query_lower)
             {
                 if let Some(parsed) = parse_line(raw_line, format) {
-                    results.push((date.clone(), parsed));
-                    if results.len() >= limit {
-                        return results;
+                    lines.push((date.clone(), parsed));
+                    if lines.len() >= limit {
+                        return SearchResults {
+                            lines,
+                            stopped_at_days: None,
+                        };
                     }
                 }
             }
         }
     }
 
-    results
+    SearchResults {
+        lines,
+        stopped_at_days,
+    }
 }

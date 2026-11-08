@@ -2,6 +2,8 @@
 //! AI-assisted search.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,6 +16,7 @@ use tokio::sync::broadcast;
 use tokio::sync::{RwLock, Semaphore};
 
 mod ai;
+mod limits;
 mod parser;
 mod search;
 mod server;
@@ -48,11 +51,20 @@ pub struct Config {
     /// URL prefix when served behind a reverse proxy, normalized to `/foo` or empty.
     #[serde(default)]
     pub base_path: String,
+    /// Peers whose X-Real-IP header names the client, for per-address limits.
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<IpAddr>,
+    /// Limits on the plain-text search page.
+    #[serde(default)]
+    pub search: SearchConfig,
     /// AI search settings; the ask endpoints 404 when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai: Option<AiConfig>,
 }
 
+fn default_trusted_proxies() -> Vec<IpAddr> {
+    vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()]
+}
 fn default_bind() -> String {
     "[::]:8080".into()
 }
@@ -74,6 +86,24 @@ fn default_ai_max_tool_calls() -> usize {
 fn default_ai_max_query_len() -> usize {
     500
 }
+fn default_ai_requests_per_day_per_client() -> NonZeroU32 {
+    NonZeroU32::new(100).unwrap()
+}
+fn default_ai_requests_per_day_per_ip() -> NonZeroU32 {
+    NonZeroU32::new(250).unwrap()
+}
+fn default_search_max_concurrent() -> NonZeroUsize {
+    NonZeroUsize::new(2).unwrap()
+}
+fn default_search_per_ip_per_minute() -> NonZeroU32 {
+    NonZeroU32::new(30).unwrap()
+}
+fn default_search_max_query_len() -> usize {
+    200
+}
+fn default_search_max_days() -> usize {
+    365
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -83,6 +113,8 @@ impl Default for Config {
             search_limit: default_search_limit(),
             logs_dirs: vec![PathBuf::from("./logs")],
             base_path: String::new(),
+            trusted_proxies: default_trusted_proxies(),
+            search: SearchConfig::default(),
             ai: None,
         }
     }
@@ -107,9 +139,43 @@ pub struct AiConfig {
     /// Longest accepted question, in characters.
     #[serde(default = "default_ai_max_query_len")]
     pub max_query_len: usize,
+    /// Anthropic API requests one browser (ask_id cookie) may make per day.
+    #[serde(default = "default_ai_requests_per_day_per_client")]
+    pub requests_per_day_per_client: NonZeroU32,
+    /// Anthropic API requests one client address may make per day.
+    #[serde(default = "default_ai_requests_per_day_per_ip")]
+    pub requests_per_day_per_ip: NonZeroU32,
     /// Replaces the built-in system prompt; the channel list is appended either way.
     #[serde(default)]
     pub system_prompt: Option<String>,
+}
+
+/// Limits on the plain-text search page.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Searches allowed to run at once; further requests get 503.
+    #[serde(default = "default_search_max_concurrent")]
+    pub max_concurrent: NonZeroUsize,
+    /// Searches one client address may start per minute; further requests get 429.
+    #[serde(default = "default_search_per_ip_per_minute")]
+    pub per_ip_per_minute: NonZeroU32,
+    /// Longest accepted query, in characters.
+    #[serde(default = "default_search_max_query_len")]
+    pub max_query_len: usize,
+    /// Days scanned, newest first, before a search stops.
+    #[serde(default = "default_search_max_days")]
+    pub max_days: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: default_search_max_concurrent(),
+            per_ip_per_minute: default_search_per_ip_per_minute(),
+            max_query_len: default_search_max_query_len(),
+            max_days: default_search_max_days(),
+        }
+    }
 }
 
 /// One directory holding a channel's logs, with the format its files use.
@@ -174,10 +240,28 @@ pub struct AppState {
     pub ai_semaphore: Option<Arc<Semaphore>>,
     /// HTTP client for the Anthropic API; `None` when AI is disabled.
     pub reqwest_client: Option<reqwest::Client>,
+    /// Per-client budgets for ask and search.
+    pub limits: limits::Limits,
+    /// Messages endpoint, pointed at a local stand-in by tests.
+    #[cfg(test)]
+    pub api_url: String,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
+    // The OpenWrt init caps address space at 250 MB; tokio's default of 512
+    // blocking threads with 2 MB stacks could reserve four times that.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(16)
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("cannot start the async runtime: {e}");
+            std::process::exit(1);
+        });
+    runtime.block_on(run());
+}
+
+async fn run() {
     let cli = Cli::parse();
 
     let mut config: Config = if cli
@@ -204,6 +288,8 @@ async fn main() {
             "#  max_concurrent: 1\n",
             "#  max_tool_calls: 100\n",
             "#  max_query_len: 500\n",
+            "#  requests_per_day_per_client: 100\n",
+            "#  requests_per_day_per_ip: 250\n",
             "#  system_prompt: |\n",
             "#    Custom system prompt text here.\n",
             "#    The channel list is always appended automatically.\n",
@@ -258,6 +344,7 @@ async fn main() {
         }
         None => (None, None),
     };
+    let limits = limits::Limits::new(&config);
     let state = Arc::new(AppState {
         config,
         logs_dirs,
@@ -265,9 +352,13 @@ async fn main() {
         sse_senders: RwLock::new(HashMap::new()),
         ai_semaphore,
         reqwest_client,
+        limits,
+        #[cfg(test)]
+        api_url: crate::ai::ANTHROPIC_MESSAGES_URL.to_owned(),
     });
 
     tail::start_watcher(Arc::clone(&state));
+    tokio::spawn(prune_limits(Arc::clone(&state)));
 
     let app = if state
         .config
@@ -292,10 +383,24 @@ async fn main() {
             std::process::exit(1);
         });
     eprintln!("listening on {bind}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .unwrap();
+}
+
+async fn prune_limits(state: Arc<AppState>) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+    loop {
+        tick.tick()
+            .await;
+        state
+            .limits
+            .prune();
+    }
 }
 
 // Under ujail the process is PID 1 in its own namespace, where the kernel drops

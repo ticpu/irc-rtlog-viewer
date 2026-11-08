@@ -10,6 +10,16 @@ use crate::Channel;
 use crate::parser::parse_line;
 use crate::server::{channel_dates, read_log_file, resolve_log_path};
 
+pub const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// Who an ask session bills its Anthropic requests to.
+pub struct AskClient {
+    /// The ask_id cookie value.
+    pub id: String,
+    /// The client address, see `Limits::client_addr`.
+    pub addr: std::net::IpAddr,
+}
+
 pub enum SseEvent {
     ToolCall {
         name: String,
@@ -593,6 +603,7 @@ pub async fn run_ai_session(
     query: String,
     channel: Channel,
     state: Arc<AppState>,
+    billed_to: AskClient,
     tx: mpsc::UnboundedSender<SseEvent>,
 ) {
     let ai_config = match &state
@@ -613,7 +624,12 @@ pub async fn run_ai_session(
         }
     };
 
-    let api_url = "https://api.anthropic.com/v1/messages";
+    #[cfg(not(test))]
+    let api_url = ANTHROPIC_MESSAGES_URL;
+    #[cfg(test)]
+    let api_url = state
+        .api_url
+        .as_str();
 
     let system_prompt = build_system_prompt(&state);
     let tools = build_tool_definitions();
@@ -652,12 +668,23 @@ pub async fn run_ai_session(
 
     let mut output_buf = String::new();
 
-    for _iteration in 0..max_tool_calls {
+    for iteration in 0..max_tool_calls {
         // The permit is held for the whole session, so a client that disconnects
         // would otherwise keep billing and block the next request.
         if tx.is_closed() {
             eprintln!("ask: client disconnected, abandoning session");
             return;
+        }
+
+        // serve_ask_stream charged the first request before starting the session.
+        if iteration > 0 {
+            if let Err(refusal) = state
+                .limits
+                .charge_ask(&billed_to.id, billed_to.addr)
+            {
+                let _ = tx.send(SseEvent::Error(refusal.to_string()));
+                return;
+            }
         }
 
         let msg_json = serde_json::to_string(&messages).unwrap_or_default();
@@ -1069,7 +1096,7 @@ mod tests {
                 format: LogFormat::Iso8601,
             }],
         );
-        app_state(channels)
+        app_state(channels, "logs_dirs: []")
     }
 
     #[test]

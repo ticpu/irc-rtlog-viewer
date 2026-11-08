@@ -37,12 +37,23 @@ base_path: /irc
 logs_dirs:
 - /mnt/data/irc-log-archive
 - /mnt/data/znc/log
+trusted_proxies:
+- 127.0.0.1
+- ::1
+search:
+  max_concurrent: 2
+  per_ip_per_minute: 30
+  max_query_len: 200
+  max_days: 365
 ai:
   api_key: sk-ant-api03-...
   model: claude-haiku-4-5-20251001
   output_dir: /var/lib/irc-logs/ask
   max_concurrent: 1
   max_tool_calls: 100
+  max_query_len: 500
+  requests_per_day_per_client: 100
+  requests_per_day_per_ip: 250
   system_prompt: |
     Custom system prompt here.
     The channel list is always appended automatically.
@@ -54,9 +65,21 @@ ai:
 |--------|---------|-------------|
 | `bind` | `[::]:8080` | Address and port to listen on; `[::]` accepts IPv4 too unless net.ipv6.bindv6only is set. Quote it in YAML. |
 | `title` | `IRC Logs` | Page title shown in the sidebar and browser tab |
-| `search_limit` | `10000` | Maximum number of lines to scan per channel during search |
+| `search_limit` | `10000` | Maximum number of matching lines a search returns |
 | `logs_dirs` | `[./logs]` | List of directories containing IRC log channels |
 | `base_path` | *(empty)* | URL prefix for reverse proxy subpath deployments (e.g. `/irc`) |
+| `trusted_proxies` | `[127.0.0.1, ::1]` | Peers whose `X-Real-IP` header is taken as the client address for per-address limits; from any other peer the TCP address is used |
+
+### Search options
+
+Per-address limits key IPv4 clients by address and IPv6 clients by their /64. Counters live in memory and reset on restart.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `search.max_concurrent` | `2` | Searches running at once; further requests get 503 |
+| `search.per_ip_per_minute` | `30` | Searches one client address may start per minute; further requests get 429 with Retry-After |
+| `search.max_query_len` | `200` | Longest accepted query, in characters |
+| `search.max_days` | `365` | Days scanned, newest first; the results page says when older days were skipped |
 
 ### Log directory structure
 
@@ -75,11 +98,16 @@ The `ai` section is optional. When omitted, the "ask" feature is disabled and no
 | `ai.api_key` | *(required)* | Anthropic API key |
 | `ai.model` | `claude-haiku-4-5-20251001` | Model ID to use |
 | `ai.output_dir` | *(required)* | Directory where output markdown files are written |
-| `ai.max_concurrent` | `1` | Maximum concurrent AI sessions (returns 503 when full) |
+| `ai.max_concurrent` | `1` | Maximum concurrent AI sessions; a further ask is refused with a message on the page |
 | `ai.max_tool_calls` | `100` | Maximum API round-trips per session before stopping |
+| `ai.max_query_len` | `500` | Longest accepted question, in characters |
+| `ai.requests_per_day_per_client` | `100` | Anthropic API requests one browser may make per day, tracked by an `ask_id` cookie the ask page sets |
+| `ai.requests_per_day_per_ip` | `250` | Anthropic API requests one client address may make per day |
 | `ai.system_prompt` | *(built-in)* | Override the system prompt sent to the model. The available channel list is always appended regardless. |
 
 The built-in system prompt instructs the model to search logs using the provided tools, compile relevant excerpts, format output as markdown, and always produce a result document via the `done` tool.
+
+The daily budgets are rolling: a full allowance of N refills one request every 24h/N. A browser can drop its cookie for a fresh client budget, so the address budget is the binding one. A session that runs out mid-way stops with an error on the page.
 
 ## Reverse proxy
 

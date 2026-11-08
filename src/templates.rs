@@ -1,6 +1,7 @@
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::parser::{LineKind, LogLine};
+use crate::search::SearchResults;
 use crate::{Channel, ChannelNode};
 
 fn nick_hue(nick: &str) -> u16 {
@@ -190,6 +191,7 @@ pub struct LogPageContext<'a> {
     pub is_today: bool,
     pub ai_enabled: bool,
     pub base_path: &'a str,
+    pub search_max_len: usize,
 }
 
 pub fn log_page(ctx: &LogPageContext) -> Markup {
@@ -233,7 +235,7 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     }
                     " "
                     form.search-form action=(format!("{bp}/{encoded}/search")) method="get" {
-                        input type="text" name="q" placeholder="search…";
+                        input type="text" name="q" placeholder="search…" maxlength=(ctx.search_max_len);
                         button type="submit" { "go" }
                     }
                     @if ai_enabled {
@@ -257,8 +259,9 @@ pub fn search_page(
     tree: &ChannelNode,
     channel: &Channel,
     query: &str,
-    results: &[(String, LogLine)],
+    results: &SearchResults,
     base_path: &str,
+    max_query_len: usize,
 ) -> Markup {
     let encoded = channel.url_path();
     page(
@@ -270,16 +273,19 @@ pub fn search_page(
                 h1 { (&channel.name) " — search" }
                 div.controls {
                     form.search-form action=(format!("{base_path}/{encoded}/search")) method="get" {
-                        input type="text" name="q" value=(query) placeholder="search…";
+                        input type="text" name="q" value=(query) placeholder="search…" maxlength=(max_query_len);
                         button type="submit" { "go" }
                     }
                 }
             }
             div id="log" {
-                @if results.is_empty() {
+                @if let Some(days) = results.stopped_at_days {
+                    p.search-note { "Searched the newest " (days) " days; older logs were not searched." }
+                }
+                @if results.lines.is_empty() {
                     p { "no results for \"" (query) "\"" }
                 }
-                @for (date, line) in results {
+                @for (date, line) in &results.lines {
                     div.line {
                         a.date href=(format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor())) {
                             (date)
