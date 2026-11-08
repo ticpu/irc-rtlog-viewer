@@ -15,6 +15,15 @@ pub const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages"
 const MAX_RESPONSE_TOKENS: u32 = 16_000;
 /// Haiku 5.5's default, sent explicitly so a model change does not shift it.
 const EFFORT: &str = "medium";
+/// Old tool results are cleared server-side once a prompt passes this; the newest
+/// KEEP_TOOL_USES stay, since `copy` works from their line numbers.
+const CLEAR_TOOL_RESULTS_AT: u64 = 60_000;
+const KEEP_TOOL_USES: u64 = 4;
+/// Clearing invalidates the cache, so a pass must free at least this many tokens.
+const CLEAR_AT_LEAST: u64 = 10_000;
+/// A session whose prompt still passes this stops and keeps what it found;
+/// Haiku 5.5 bills prompts over 100K tokens at five times the rate.
+const MAX_PROMPT_TOKENS: u64 = 90_000;
 
 /// Who an ask session bills its Anthropic requests to.
 pub struct AskClient {
@@ -703,12 +712,20 @@ pub async fn run_ai_session(
     let max_tool_calls = ai_config.max_tool_calls;
 
     let mut output_buf = String::new();
+    // Prompt size the API reported for the last request, cached parts included.
+    let mut prompt_tokens = 0;
 
     for iteration in 0..max_tool_calls {
         // The permit is held for the whole session, so a client that disconnects
         // would otherwise keep billing and block the next request.
         if tx.is_closed() {
             eprintln!("ask: client disconnected, abandoning session");
+            return;
+        }
+
+        if prompt_tokens > MAX_PROMPT_TOKENS {
+            let reason = format!("the conversation passed {MAX_PROMPT_TOKENS} tokens");
+            finish_early(&reason, &query, &state, &output_buf, &tx);
             return;
         }
 
@@ -723,12 +740,6 @@ pub async fn run_ai_session(
             }
         }
 
-        let msg_json = serde_json::to_string(&messages).unwrap_or_default();
-        if msg_json.len() > 150_000 {
-            let _ = tx.send(SseEvent::Error("context limit reached".into()));
-            break;
-        }
-
         // Earlier messages are never edited: Haiku 5.5 rejects replayed thinking
         // blocks once anything before them changes.
         let body = json!({
@@ -736,6 +747,12 @@ pub async fn run_ai_session(
             "max_tokens": MAX_RESPONSE_TOKENS,
             "output_config": {"effort": EFFORT},
             "cache_control": {"type": "ephemeral"},
+            "context_management": {"edits": [{
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": CLEAR_TOOL_RESULTS_AT},
+                "keep": {"type": "tool_uses", "value": KEEP_TOOL_USES},
+                "clear_at_least": {"type": "input_tokens", "value": CLEAR_AT_LEAST},
+            }]},
             "system": [{
                 "type": "text",
                 "text": system_prompt,
@@ -748,6 +765,7 @@ pub async fn run_ai_session(
             .post(api_url)
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "context-management-2025-06-27")
             .json(&body)
             .send()
             .await
@@ -756,7 +774,7 @@ pub async fn run_ai_session(
             Err(e) => {
                 eprintln!("ai: API request failed: {e}");
                 let _ = tx.send(SseEvent::Error(format!("API request failed: {e}")));
-                break;
+                return;
             }
         };
 
@@ -769,14 +787,14 @@ pub async fn run_ai_session(
             Err(e) => {
                 eprintln!("ai: API read failed: {e}");
                 let _ = tx.send(SseEvent::Error(format!("API read failed: {e}")));
-                break;
+                return;
             }
         };
 
         if !status.is_success() {
             eprintln!("ai: API error {status}: {resp_text}");
             let _ = tx.send(SseEvent::Error(format!("API error {status}")));
-            break;
+            return;
         }
 
         let resp_json: Value = match serde_json::from_str(&resp_text) {
@@ -784,7 +802,7 @@ pub async fn run_ai_session(
             Err(e) => {
                 eprintln!("ai: invalid API response: {e}");
                 let _ = tx.send(SseEvent::Error(format!("invalid API response: {e}")));
-                break;
+                return;
             }
         };
 
@@ -803,6 +821,17 @@ pub async fn run_ai_session(
                 .unwrap_or(0);
             eprintln!(
                 "ai: tokens: input={input} cache_create={cache_create} cache_read={cache_read} output={output}"
+            );
+            prompt_tokens = input + cache_create + cache_read;
+        }
+        for edit in resp_json["context_management"]["applied_edits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            eprintln!(
+                "ai: context editing cleared {} tool uses, {} input tokens",
+                edit["cleared_tool_uses"], edit["cleared_input_tokens"]
             );
         }
 
@@ -840,11 +869,11 @@ pub async fn run_ai_session(
             } else {
                 let _ = tx.send(SseEvent::Error("no results found".into()));
             }
-            break;
+            return;
         }
 
         if stop_reason == "tool_use" {
-            let Some(blocks) = content else { break };
+            let Some(blocks) = content else { return };
             let blocks: Vec<Value> = blocks.clone();
 
             messages.push(json!({
@@ -920,7 +949,7 @@ pub async fn run_ai_session(
             }));
 
             if should_stop {
-                break;
+                return;
             }
         } else {
             let msg = match stop_reason {
@@ -935,9 +964,34 @@ pub async fn run_ai_session(
             };
             eprintln!("ai: session stopped: {msg}");
             let _ = tx.send(SseEvent::Error(msg));
-            break;
+            return;
         }
     }
+    let reason = format!("stopped after {max_tool_calls} API requests");
+    finish_early(&reason, &query, &state, &output_buf, &tx);
+}
+
+/// Ends a session that stopped before calling done: saves what the output buffer
+/// holds and says why it is partial, or reports `reason` alone.
+fn finish_early(
+    reason: &str,
+    query: &str,
+    state: &AppState,
+    output_buf: &str,
+    tx: &mpsc::UnboundedSender<SseEvent>,
+) {
+    eprintln!("ai: session stopped early: {reason}");
+    if output_buf
+        .trim()
+        .is_empty()
+    {
+        let _ = tx.send(SseEvent::Error(reason.to_owned()));
+        return;
+    }
+    let _ = tx.send(SseEvent::Display(format!(
+        "{reason}; saving what was found so far"
+    )));
+    execute_done(&json!({"title": query}), state, output_buf, tx);
 }
 
 fn summarize_input(tool_name: &str, input: &Value) -> String {

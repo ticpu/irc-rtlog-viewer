@@ -1184,21 +1184,30 @@ mod limit_tests {
 
     type Requests = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 
-    /// Stands in for the Messages API: records each request body and answers
-    /// every one with `reply`.
+    /// Stands in for the Messages API: records each request body, with its
+    /// anthropic-beta header added, and answers every one with `reply`.
     async fn fake_api(reply: serde_json::Value) -> (String, Requests) {
         let requests = Requests::default();
         let recorded = Arc::clone(&requests);
         let api = Router::new().route(
             "/v1/messages",
-            post(move |body: String| {
+            post(move |headers: HeaderMap, body: String| {
                 let recorded = Arc::clone(&recorded);
                 let reply = reply.to_string();
                 async move {
+                    let mut body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    // Kept beside the body so tests can check the beta header.
+                    body["anthropic-beta"] = headers
+                        .get("anthropic-beta")
+                        .and_then(|v| {
+                            v.to_str()
+                                .ok()
+                        })
+                        .into();
                     recorded
                         .lock()
                         .unwrap()
-                        .push(serde_json::from_str(&body).unwrap());
+                        .push(body);
                     ([(header::CONTENT_TYPE, "application/json")], reply)
                 }
             }),
@@ -1309,6 +1318,79 @@ mod limit_tests {
         }
         assert_eq!(requests[0]["model"], "claude-haiku-5-5");
         assert_eq!(requests[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[tokio::test]
+    async fn ask_requests_clear_old_tool_results_server_side() {
+        let (url, requests) = fake_api(display_reply()).await;
+        let out = tempdir();
+        let app = ask_app(url, out.path(), ", max_tool_calls: 1");
+        get(&app, ASK, &[("cookie", &cookie("00ee"))]).await;
+        let requests = requests
+            .lock()
+            .unwrap();
+        assert_eq!(
+            requests[0]["anthropic-beta"],
+            "context-management-2025-06-27"
+        );
+        let edit = &requests[0]["context_management"]["edits"][0];
+        assert_eq!(edit["type"], "clear_tool_uses_20250919");
+        assert_eq!(edit["trigger"]["type"], "input_tokens");
+    }
+
+    #[tokio::test]
+    async fn a_session_past_the_token_guard_stops_cleanly() {
+        let mut reply = display_reply();
+        reply["usage"] = serde_json::json!({
+            "input_tokens": 1_000,
+            "cache_read_input_tokens": 95_000,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 10,
+        });
+        let (url, requests) = fake_api(reply).await;
+        let out = tempdir();
+        let app = ask_app(url, out.path(), "");
+        let (_, _, body) = get(&app, ASK, &[("cookie", &cookie("00ff"))]).await;
+        assert!(
+            body.contains("the conversation passed 90000 tokens"),
+            "{body}"
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn running_out_of_requests_saves_what_was_found() {
+        let (url, _) = fake_api(serde_json::json!({
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "t", "name": "output", "input": {"text": "found it"}}],
+        }))
+        .await;
+        let out = tempdir();
+        let app = ask_app(url, out.path(), ", max_tool_calls: 3");
+        let (_, _, body) = get(&app, ASK, &[("cookie", &cookie("0a11"))]).await;
+        assert!(
+            body.contains("stopped after 3 API requests; saving"),
+            "{body}"
+        );
+        assert!(body.contains("event: done"), "{body}");
+        let saved: Vec<_> = std::fs::read_dir(out.path())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(saved.len(), 1);
+        let text = std::fs::read_to_string(saved[0].path()).unwrap();
+        assert_eq!(
+            text.matches("found it")
+                .count(),
+            3,
+            "{text}"
+        );
     }
 
     #[tokio::test]
