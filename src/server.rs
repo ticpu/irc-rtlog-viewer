@@ -316,7 +316,7 @@ fn looks_like_date(s: &str) -> bool {
             .all(u8::is_ascii_digit)
 }
 
-fn today_date() -> String {
+pub fn today_date() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 
 use crate::AppState;
 use crate::Channel;
-use crate::parser::parse_line;
-use crate::server::{channel_dates, read_log_file, resolve_log_path};
+use crate::parser::{LogFormat, parse_line};
+use crate::server::{channel_dates, read_log_file, resolve_log_path, today_date};
 
 pub const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 /// Room for adaptive thinking, which counts toward it, plus one tool call or answer.
@@ -55,13 +55,14 @@ You are an IRC log search assistant. Search IRC logs using tools and compile rel
 
 Workflow:
 1. Use display to tell the user what you're searching for
-2. Use search to find relevant messages (use n first to gauge volume, then C for context)
+2. Find the messages: activity shows which days had discussion, read goes through a day in order, search finds messages by regex across days (use n first to gauge volume, then C for context)
 3. Use copy to include relevant log lines in the output
 4. Use output to add titles, separators, and factual summaries
 5. Use done to save and finish -- you MUST always call done to produce a result
 
 Rules:
-- The user message names the channel to search by default; search other channels only when the question calls for it
+- The user message names the channel to search by default and gives today's date; search other channels only when the question calls for it
+- Joins, parts, quits, nick changes and server notices are hidden unless you ask for events; they are not discussion, so leave them out of summaries unless the question is about them
 - Only retrieve and summarize IRC log content
 - Summaries must be grounded in the log data -- no speculation
 - If the query is unrelated to IRC log search, call abort immediately
@@ -160,7 +161,7 @@ fn build_tool_definitions() -> Vec<Value> {
                     },
                     "events": {
                         "type": "boolean",
-                        "description": "Include join/part/quit/nick-change lines (default: false, only messages and actions are searched)"
+                        "description": "Include joins, parts, quits, nick changes and server notices (default false: only messages and actions are searched)"
                     },
                     "c": {
                         "type": "integer",
@@ -168,6 +169,54 @@ fn build_tool_definitions() -> Vec<Value> {
                     }
                 },
                 "required": ["pattern", "channel"]
+            }
+        }),
+        json!({
+            "name": "activity",
+            "description": "Message count per day for a channel, newest day first. Days with logs but no messages (only joins, quits and notices) are counted in the summary line, not listed. Use it to find when a channel was active before reading or searching.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Channel path (e.g. \"OFTC/#bcachefs-dev\")"
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Start of date range YYYY-MM-DD (inclusive)"
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "End of date range YYYY-MM-DD (inclusive)"
+                    }
+                },
+                "required": ["channel"]
+            }
+        }),
+        json!({
+            "name": "read",
+            "description": "Read one day of a channel's log in order, messages only, with line numbers for copy. Long days come in pages: the result ends with the from_line to continue from, or with the end of the day.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Channel path (e.g. \"OFTC/#bcachefs-dev\")"
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Date YYYY-MM-DD"
+                    },
+                    "from_line": {
+                        "type": "integer",
+                        "description": "Line number to start from (default 1)"
+                    },
+                    "events": {
+                        "type": "boolean",
+                        "description": "Include joins, parts, quits, nick changes and server notices (default false)"
+                    }
+                },
+                "required": ["channel", "date"]
             }
         }),
         json!({
@@ -320,54 +369,27 @@ fn execute_search(input: &Value, state: &AppState) -> String {
                 .unwrap_or(0),
         ) as usize;
 
-    let specific_date = input["date"]
+    let dates = match input["date"]
         .as_str()
-        .filter(|d| d.len() == 10);
-    let from_date = input["from_date"]
-        .as_str()
-        .filter(|d| d.len() == 10);
-    let to_date = input["to_date"]
-        .as_str()
-        .filter(|d| d.len() == 10);
-    let oldest_first = input["order"].as_str() == Some("oldest");
-
-    let dates: Vec<String> = if let Some(date) = specific_date {
-        vec![date.to_string()]
-    } else {
-        let mut d = channel_dates(channel);
-        if let Some(from) = from_date {
-            d.retain(|date| date.as_str() >= from);
-        }
-        if let Some(to) = to_date {
-            d.retain(|date| date.as_str() <= to);
-        }
-        if !oldest_first {
-            d.reverse();
-        }
-        d
+        .filter(|d| d.len() == 10)
+    {
+        Some(date) => vec![date.to_string()],
+        None => dates_in_range(channel, input),
     };
 
     let mut out = String::new();
     let mut total_matches = 0;
-    let mut dates_scanned = 0;
+    let mut days_with_logs = 0;
 
     'dates: for date in &dates {
-        if dates_scanned >= 365 {
-            out.push_str("\n[stopped: 365 dates scanned]\n");
+        if days_with_logs >= MAX_DAYS_SCANNED {
+            out.push_str(&format!("\n[stopped: {MAX_DAYS_SCANNED} days scanned]\n"));
             break;
         }
-        dates_scanned += 1;
-
-        let Some((path, format)) = resolve_log_path(channel, date) else {
+        let Some((all_lines, format)) = day_lines(channel, date) else {
             continue;
         };
-        let Ok(content) = read_log_file(&path) else {
-            continue;
-        };
-        let all_lines: Vec<String> = content
-            .lines()
-            .map(strip_controls)
-            .collect();
+        days_with_logs += 1;
 
         let mut date_matches = 0;
         let mut emitted_lines: BTreeSet<usize> = BTreeSet::new();
@@ -376,18 +398,7 @@ fn execute_search(input: &Value, state: &AppState) -> String {
             .iter()
             .enumerate()
         {
-            if !line
-                .trim()
-                .is_empty()
-                && re.is_match(line)
-            {
-                if !include_events {
-                    if let Some(parsed) = parse_line(line, format) {
-                        if parsed.is_event() {
-                            continue;
-                        }
-                    }
-                }
+            if is_shown(line, format, include_events) && re.is_match(line) {
                 date_matches += 1;
                 if !count_only {
                     let start = i.saturating_sub(context_before);
@@ -415,12 +426,8 @@ fn execute_search(input: &Value, state: &AppState) -> String {
         ));
         let mut prev_line: Option<usize> = None;
         for j in &emitted_lines {
-            if !include_events {
-                if let Some(parsed) = parse_line(&all_lines[*j], format) {
-                    if parsed.is_event() {
-                        continue;
-                    }
-                }
+            if !is_shown(&all_lines[*j], format, include_events) {
+                continue;
             }
             if let Some(p) = prev_line {
                 if *j > p + 1 {
@@ -443,14 +450,151 @@ fn execute_search(input: &Value, state: &AppState) -> String {
     }
 
     if total_matches == 0 {
-        format!("no matches for \"{pattern}\" in {channel_path}")
+        format!(
+            "no messages matching \"{pattern}\" in {channel_path} ({days_with_logs} days with \
+             logs searched)"
+        )
     } else if count_only {
-        format!("{out}total: {total_matches} matches across {dates_scanned} dates scanned")
+        format!("{out}total: {total_matches} matches across {days_with_logs} days with logs")
     } else {
         out
     }
 }
 
+/// Days with logs, newest first unless `order` is "oldest", within the
+/// optional `from_date` and `to_date` of a tool input.
+fn dates_in_range(channel: &Channel, input: &Value) -> Vec<String> {
+    let mut dates = channel_dates(channel);
+    if let Some(from) = input["from_date"].as_str() {
+        dates.retain(|date| date.as_str() >= from);
+    }
+    if let Some(to) = input["to_date"].as_str() {
+        dates.retain(|date| date.as_str() <= to);
+    }
+    if input["order"].as_str() != Some("oldest") {
+        dates.reverse();
+    }
+    dates
+}
+
+/// One day's lines with control characters stripped, or None when the day has
+/// no log. Line N is index N-1: search, read and copy share this numbering.
+fn day_lines(channel: &Channel, date: &str) -> Option<(Vec<String>, LogFormat)> {
+    let (path, format) = resolve_log_path(channel, date)?;
+    match read_log_file(&path) {
+        Ok(content) => Some((
+            content
+                .lines()
+                .map(strip_controls)
+                .collect(),
+            format,
+        )),
+        Err(e) => {
+            eprintln!("ai: cannot read {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Whether a line is shown to the model: not blank, and not a join, part, quit
+/// or other notice unless events were asked for.
+fn is_shown(line: &str, format: LogFormat, include_events: bool) -> bool {
+    !line
+        .trim()
+        .is_empty()
+        && (include_events || !parse_line(line, format).is_some_and(|parsed| parsed.is_event()))
+}
+
+fn execute_read(input: &Value, state: &AppState) -> String {
+    let Some(channel_path) = input["channel"].as_str() else {
+        return "error: channel is required".into();
+    };
+    let channel = match validate_channel(channel_path, &state.channels) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let Some(date) = input["date"].as_str() else {
+        return "error: date (YYYY-MM-DD) is required".into();
+    };
+    let from_line = input["from_line"]
+        .as_u64()
+        .unwrap_or(1)
+        .max(1) as usize;
+    let include_events = input["events"]
+        .as_bool()
+        .unwrap_or(false);
+    let Some((lines, format)) = day_lines(channel, date) else {
+        return format!("no log for {date} in {channel_path}");
+    };
+
+    let mut out = format!("--- {channel_path} {date} ---\n");
+    let mut shown = 0;
+    for (i, line) in lines
+        .iter()
+        .enumerate()
+        .skip(from_line - 1)
+    {
+        if !is_shown(line, format, include_events) {
+            continue;
+        }
+        let quoted = format!("{:>5}: {}\n", i + 1, quote_line(line));
+        if out.len() + quoted.len() > MAX_SEARCH_OUTPUT {
+            out.push_str(&format!("[more: read again with from_line={}]\n", i + 1));
+            return out;
+        }
+        out.push_str(&quoted);
+        shown += 1;
+    }
+    if shown == 0 {
+        return format!(
+            "no messages in {channel_path} on {date} from line {from_line}; the log has {} \
+             lines, none of them messages",
+            lines.len()
+        );
+    }
+    out.push_str(&format!("[end of {date}, {} lines]\n", lines.len()));
+    out
+}
+
+fn execute_activity(input: &Value, state: &AppState) -> String {
+    let Some(channel_path) = input["channel"].as_str() else {
+        return "error: channel is required".into();
+    };
+    let channel = match validate_channel(channel_path, &state.channels) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let mut out = String::new();
+    let mut days_with_logs = 0;
+    let mut days_with_messages = 0;
+    for date in dates_in_range(channel, input)
+        .iter()
+        .take(MAX_DAYS_SCANNED)
+    {
+        let Some((lines, format)) = day_lines(channel, date) else {
+            continue;
+        };
+        days_with_logs += 1;
+        let messages = lines
+            .iter()
+            .filter(|line| is_shown(line, format, false))
+            .count();
+        if messages == 0 {
+            continue;
+        }
+        days_with_messages += 1;
+        let row = format!("{date}: {messages} messages\n");
+        if out.len() + row.len() > MAX_SEARCH_OUTPUT {
+            out.push_str("[stopped: output size limit, narrow the date range]\n");
+            break;
+        }
+        out.push_str(&row);
+    }
+    format!("{out}{days_with_logs} days with logs, {days_with_messages} of them with messages")
+}
+
+/// Most days with logs one search or activity call goes through.
+const MAX_DAYS_SCANNED: usize = 365;
 /// Bound on one search result, checked before each line is added.
 const MAX_SEARCH_OUTPUT: usize = 8000;
 /// Longest log line a search result quotes; the rest is elided with a count.
@@ -507,23 +651,16 @@ fn execute_copy(input: &Value, state: &AppState, output_buf: &mut String) -> Str
         return "error: max 500 lines per copy".into();
     }
 
-    let Some((path, _)) = resolve_log_path(channel, date) else {
+    let Some((all_lines, _)) = day_lines(channel, date) else {
         return format!("no log for {date} in {channel_path}");
     };
-    let Ok(content) = read_log_file(&path) else {
-        return format!("error reading log for {date}");
-    };
-
-    let all_lines: Vec<&str> = content
-        .lines()
-        .collect();
     output_buf.push_str(&format!("--- {channel_path} {date} ---\n"));
     let mut copied = 0;
     for n in &line_nums {
         if *n == 0 || *n > all_lines.len() {
             continue;
         }
-        output_buf.push_str(&strip_controls(all_lines[*n - 1]));
+        output_buf.push_str(&all_lines[*n - 1]);
         output_buf.push('\n');
         copied += 1;
     }
@@ -696,9 +833,11 @@ pub async fn run_ai_session(
     let mut messages: Vec<Value> = vec![json!({
         "role": "user",
         "content": format!(
-            "Default channel to search: {channel_path}\n\
+            "Today's date (UTC): {today}\n\
+             Default channel to search: {channel_path}\n\
              Search other channels only if the question below names them.\n\n\
-             Question:\n{query}"
+             Question:\n{query}",
+            today = today_date(),
         ),
     })];
 
@@ -908,12 +1047,17 @@ pub async fn run_ai_session(
                 }
 
                 let result = match tool_name {
-                    "search" => {
+                    "search" | "read" | "activity" => {
                         let state = Arc::clone(&state);
                         let input = tool_input.clone();
-                        tokio::task::spawn_blocking(move || execute_search(&input, &state))
-                            .await
-                            .unwrap_or_else(|e| format!("error: search failed: {e}"))
+                        let name = tool_name.to_owned();
+                        tokio::task::spawn_blocking(move || match name.as_str() {
+                            "search" => execute_search(&input, &state),
+                            "read" => execute_read(&input, &state),
+                            _ => execute_activity(&input, &state),
+                        })
+                        .await
+                        .unwrap_or_else(|e| format!("error: {tool_name} failed: {e}"))
                     }
                     "copy" => execute_copy(tool_input, &state, &mut output_buf),
                     "output" => execute_output(tool_input, &mut output_buf),
@@ -1024,6 +1168,43 @@ fn summarize_input(tool_name: &str, input: &Value) -> String {
             }
             if let Some(c) = input["C"].as_u64() {
                 s.push_str(&format!(", C={c}"));
+            }
+            if input["events"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                s.push_str(", with events");
+            }
+            s
+        }
+        "activity" => {
+            let channel = input["channel"]
+                .as_str()
+                .unwrap_or("?");
+            let from = input["from_date"]
+                .as_str()
+                .unwrap_or("first log");
+            let to = input["to_date"]
+                .as_str()
+                .unwrap_or("last log");
+            format!("{channel} {from} to {to}")
+        }
+        "read" => {
+            let channel = input["channel"]
+                .as_str()
+                .unwrap_or("?");
+            let date = input["date"]
+                .as_str()
+                .unwrap_or("?");
+            let from = input["from_line"]
+                .as_u64()
+                .unwrap_or(1);
+            let mut s = format!("{channel} {date} from line {from}");
+            if input["events"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                s.push_str(", with events");
             }
             s
         }
@@ -1219,6 +1400,120 @@ mod tests {
         assert!(
             big_day.ends_with("[stopped: output size limit]\n"),
             "{big_day}"
+        );
+    }
+
+    /// A ZNC-format `#c` channel: a mixed day, a day of joins only, a long day.
+    fn state_with_days(root: &std::path::Path) -> AppState {
+        let dir = root.join("#c");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("2026-01-01.log"),
+            "[00:00:01] *** Joins: a (~a@host)\n\
+             [00:00:02] *** Server sets mode: +nt \n\
+             [00:00:03] <a> first message\n\
+             [00:00:04] *** Quits: b (~b@host) (bye)\n\
+             [00:00:05] * a waves\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("2026-01-02.log"),
+            "[00:00:01] *** Joins: a (~a@host)\n[00:00:02] *** Quits: a (~a@host) (bye)\n",
+        )
+        .unwrap();
+        let long: String = (1..=400)
+            .map(|i| format!("[00:00:00] <a> message number {i}\n"))
+            .collect();
+        std::fs::write(dir.join("2026-01-03.log"), long).unwrap();
+        let mut channels = ChannelNode::default();
+        add_channel(
+            &mut channels,
+            &["#c"],
+            vec![ChannelDir {
+                path: dir,
+                format: LogFormat::Znc,
+            }],
+        );
+        app_state(channels, "logs_dirs: []")
+    }
+
+    #[test]
+    fn activity_lists_days_with_messages_only() {
+        let root = tempdir();
+        let state = state_with_days(root.path());
+        let out = execute_activity(&json!({"channel": "#c"}), &state);
+        assert_eq!(
+            out,
+            "2026-01-03: 400 messages\n2026-01-01: 2 messages\n3 days with logs, 2 of them with \
+             messages"
+        );
+    }
+
+    #[test]
+    fn read_shows_messages_in_order_and_pages_long_days() {
+        let root = tempdir();
+        let state = state_with_days(root.path());
+
+        let mixed = execute_read(&json!({"channel": "#c", "date": "2026-01-01"}), &state);
+        assert_eq!(
+            mixed,
+            "--- #c 2026-01-01 ---\n    3: [00:00:03] <a> first message\n    5: [00:00:05] * a \
+             waves\n[end of 2026-01-01, 5 lines]\n"
+        );
+        let mut buf = String::new();
+        execute_copy(
+            &json!({"channel": "#c", "date": "2026-01-01", "lines": "3"}),
+            &state,
+            &mut buf,
+        );
+        assert!(buf.ends_with("[00:00:03] <a> first message\n"), "{buf}");
+
+        let quiet = execute_read(&json!({"channel": "#c", "date": "2026-01-02"}), &state);
+        assert!(quiet.contains("2 lines, none of them messages"), "{quiet}");
+        let with_events = execute_read(
+            &json!({"channel": "#c", "date": "2026-01-02", "events": true}),
+            &state,
+        );
+        assert!(with_events.contains("*** Joins: a"), "{with_events}");
+
+        let mut from = 1;
+        let mut seen = 0;
+        loop {
+            let page = execute_read(
+                &json!({"channel": "#c", "date": "2026-01-03", "from_line": from}),
+                &state,
+            );
+            assert!(page.len() <= MAX_SEARCH_OUTPUT + 60, "{} bytes", page.len());
+            seen += page
+                .matches("message number")
+                .count();
+            if page.ends_with("[end of 2026-01-03, 400 lines]\n") {
+                break;
+            }
+            let next = page
+                .rsplit("from_line=")
+                .next()
+                .unwrap()
+                .trim_end_matches("]\n")
+                .parse::<u64>()
+                .unwrap();
+            assert!(
+                page.contains(&format!("message number {}\n", next - 1)),
+                "page ends before {next}"
+            );
+            from = next;
+        }
+        assert_eq!(seen, 400, "every line is read exactly once across pages");
+    }
+
+    #[test]
+    fn search_without_matches_says_how_much_it_searched() {
+        let root = tempdir();
+        let state = state_with_days(root.path());
+        let out = execute_search(&json!({"pattern": "nothing", "channel": "#c"}), &state);
+        assert_eq!(
+            out,
+            "no messages matching \"nothing\" in #c (3 days with logs searched)"
         );
     }
 
