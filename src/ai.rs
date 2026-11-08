@@ -338,7 +338,7 @@ fn execute_search(input: &Value, state: &AppState) -> String {
     let mut total_matches = 0;
     let mut dates_scanned = 0;
 
-    for date in &dates {
+    'dates: for date in &dates {
         if dates_scanned >= 365 {
             out.push_str("\n[stopped: 365 dates scanned]\n");
             break;
@@ -351,8 +351,9 @@ fn execute_search(input: &Value, state: &AppState) -> String {
         let Ok(content) = read_log_file(&path) else {
             continue;
         };
-        let all_lines: Vec<&str> = content
+        let all_lines: Vec<String> = content
             .lines()
+            .map(strip_controls)
             .collect();
 
         let mut date_matches = 0;
@@ -362,7 +363,11 @@ fn execute_search(input: &Value, state: &AppState) -> String {
             .iter()
             .enumerate()
         {
-            if re.is_match(line) {
+            if !line
+                .trim()
+                .is_empty()
+                && re.is_match(line)
+            {
                 if !include_events {
                     if let Some(parsed) = parse_line(line, format) {
                         if parsed.is_event() {
@@ -391,13 +396,14 @@ fn execute_search(input: &Value, state: &AppState) -> String {
             continue;
         }
 
+        total_matches += date_matches;
         out.push_str(&format!(
             "--- {channel_path} {date} ({date_matches} matches) ---\n"
         ));
         let mut prev_line: Option<usize> = None;
         for j in &emitted_lines {
             if !include_events {
-                if let Some(parsed) = parse_line(all_lines[*j], format) {
+                if let Some(parsed) = parse_line(&all_lines[*j], format) {
                     if parsed.is_event() {
                         continue;
                     }
@@ -408,18 +414,17 @@ fn execute_search(input: &Value, state: &AppState) -> String {
                     out.push_str("--\n");
                 }
             }
-            out.push_str(&format!("{:>5}: {}\n", j + 1, all_lines[*j]));
+            let quoted = format!("{:>5}: {}\n", j + 1, quote_line(&all_lines[*j]));
+            if out.len() + quoted.len() > MAX_SEARCH_OUTPUT {
+                out.push_str("\n[stopped: output size limit]\n");
+                break 'dates;
+            }
+            out.push_str(&quoted);
             prev_line = Some(*j);
         }
-        total_matches += date_matches;
 
         if total_matches >= max_results {
             out.push_str(&format!("\n[stopped: {max_results} match limit reached]\n"));
-            break;
-        }
-
-        if out.len() > 8000 {
-            out.push_str("\n[stopped: output size limit]\n");
             break;
         }
     }
@@ -431,6 +436,34 @@ fn execute_search(input: &Value, state: &AppState) -> String {
     } else {
         out
     }
+}
+
+/// Bound on one search result, checked before each line is added.
+const MAX_SEARCH_OUTPUT: usize = 8000;
+/// Longest log line a search result quotes; the rest is elided with a count.
+const MAX_QUOTED_LINE: usize = 500;
+
+/// A log line without control characters other than tab. JSON escapes each as
+/// six bytes, and a crash can leave a log ending in tens of KB of NULs.
+fn strip_controls(line: &str) -> String {
+    line.chars()
+        .filter(|c| *c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// `line` cut to MAX_QUOTED_LINE characters, saying how many were left out.
+fn quote_line(line: &str) -> String {
+    let total = line
+        .chars()
+        .count();
+    if total <= MAX_QUOTED_LINE {
+        return line.to_owned();
+    }
+    let kept: String = line
+        .chars()
+        .take(MAX_QUOTED_LINE)
+        .collect();
+    format!("{kept} [+{} chars]", total - MAX_QUOTED_LINE)
 }
 
 fn execute_copy(input: &Value, state: &AppState, output_buf: &mut String) -> String {
@@ -477,7 +510,7 @@ fn execute_copy(input: &Value, state: &AppState, output_buf: &mut String) -> Str
         if *n == 0 || *n > all_lines.len() {
             continue;
         }
-        output_buf.push_str(all_lines[*n - 1]);
+        output_buf.push_str(&strip_controls(all_lines[*n - 1]));
         output_buf.push('\n');
         copied += 1;
     }
@@ -1097,6 +1130,55 @@ mod tests {
             }],
         );
         app_state(channels, "logs_dirs: []")
+    }
+
+    #[test]
+    fn search_results_stay_small_and_free_of_control_characters() {
+        let root = tempdir();
+        let dir = root
+            .path()
+            .join("#c");
+        std::fs::create_dir(&dir).unwrap();
+        let long = "x".repeat(2000);
+        let nuls = "\0".repeat(70_000);
+        std::fs::write(
+            dir.join("2026-01-01.log"),
+            format!("2026-01-01T00:00:00Z <a> {long}\n2026-01-01T00:00:01Z <b> hi\n{nuls}"),
+        )
+        .unwrap();
+        let many: String = (0..2000)
+            .map(|i| format!("2026-01-02T00:00:00Z <a> line {i}\n"))
+            .collect();
+        std::fs::write(dir.join("2026-01-02.log"), many).unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: dir,
+            format: LogFormat::Iso8601,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        let state = app_state(channels, "logs_dirs: []");
+
+        let one_day = execute_search(
+            &json!({"pattern": ".", "channel": "#c", "date": "2026-01-01"}),
+            &state,
+        );
+        assert!(!one_day.contains('\0'), "NULs reached the model");
+        assert!(one_day.contains("[+1525 chars]"), "{one_day}");
+        assert!(one_day.contains("(2 matches)"), "{one_day}");
+
+        let big_day = execute_search(
+            &json!({"pattern": "line", "channel": "#c", "date": "2026-01-02", "c": 5000}),
+            &state,
+        );
+        assert!(
+            big_day.len() <= MAX_SEARCH_OUTPUT + 40,
+            "{} bytes",
+            big_day.len()
+        );
+        assert!(
+            big_day.ends_with("[stopped: output size limit]\n"),
+            "{big_day}"
+        );
     }
 
     #[test]
