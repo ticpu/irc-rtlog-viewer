@@ -2,6 +2,7 @@
 //! AI-assisted search.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::IntoFuture;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -383,15 +384,43 @@ async fn run() {
             std::process::exit(1);
         });
     eprintln!("listening on {bind}");
-    axum::serve(
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = stop.send(true);
+    });
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .unwrap();
+    .with_graceful_shutdown(signalled(stopping.clone()));
+    // Graceful shutdown waits for every connection, and live tails never end on
+    // their own; procd SIGKILLs after 5 s, so give up on them before that.
+    let grace = async {
+        signalled(stopping).await;
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
+    };
+    tokio::select! {
+        result = server.into_future() => if let Err(e) = result {
+            eprintln!("server failed: {e}");
+            std::process::exit(1);
+        },
+        () = grace => eprintln!(
+            "connections still open {} s after the signal, closing them",
+            SHUTDOWN_GRACE.as_secs()
+        ),
+    }
     // The tail thread holds no state; stopping it lets the runtime shut down.
     drop(tail);
+}
+
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Resolves once shutdown has been signalled, or its sender is gone.
+async fn signalled(mut stopping: tokio::sync::watch::Receiver<bool>) {
+    let _ = stopping
+        .wait_for(|s| *s)
+        .await;
 }
 
 async fn prune_limits(state: Arc<AppState>) {
