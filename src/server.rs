@@ -676,15 +676,13 @@ async fn serve_ask_output(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use axum::body::Body;
     use axum::http::Request;
-    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::{Channel, ChannelNode};
+    use crate::test_support::{add_channel, app_state, tempdir};
+    use crate::{ChannelDir, ChannelNode};
 
     const CHANNELS: &[&[&str]] = &[
         &["OFTC", "#bcache"],
@@ -695,33 +693,9 @@ mod tests {
     fn state() -> Arc<AppState> {
         let mut root = ChannelNode::default();
         for segments in CHANNELS {
-            let mut node = &mut root;
-            for seg in *segments {
-                node = node
-                    .children
-                    .entry(seg.to_string())
-                    .or_default();
-            }
-            node.channel = Some(Channel {
-                name: segments
-                    .last()
-                    .unwrap()
-                    .to_string(),
-                path_segments: segments
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                dirs: Vec::new(),
-            });
+            add_channel(&mut root, segments, Vec::new());
         }
-        Arc::new(AppState {
-            config: serde_yaml::from_str("logs_dirs: []").unwrap(),
-            logs_dirs: Vec::new(),
-            channels: root,
-            sse_senders: RwLock::new(HashMap::new()),
-            ai_semaphore: None,
-            reqwest_client: None,
-        })
+        Arc::new(app_state(root))
     }
 
     async fn get_status(uri: &str) -> (StatusCode, Option<String>) {
@@ -815,6 +789,47 @@ mod tests {
     async fn invalid_utf8_in_path_is_rejected() {
         let (status, _) = get_status("/OFTC/%FF").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn file_backed_pages_serve_the_log() {
+        let root = tempdir();
+        std::fs::write(
+            root.path()
+                .join("2026-01-01.log"),
+            "2026-01-01T00:00:00Z <a> needle\n",
+        )
+        .unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: root
+                .path()
+                .to_owned(),
+            format: LogFormat::Iso8601,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        let app = router().with_state(Arc::new(app_state(channels)));
+        for uri in [
+            "/%23c/search?q=needle",
+            "/%23c/2026-01-01",
+            "/%23c/2026-01-01/raw",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::get(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("needle"), "{uri}: {body}");
+        }
     }
 
     #[tokio::test]

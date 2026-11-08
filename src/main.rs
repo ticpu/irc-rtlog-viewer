@@ -19,6 +19,8 @@ mod search;
 mod server;
 mod tail;
 mod templates;
+#[cfg(test)]
+mod test_support;
 
 use parser::LogFormat;
 

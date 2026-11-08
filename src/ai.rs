@@ -1015,12 +1015,9 @@ pub fn parse_line_spec(spec: &str) -> Result<BTreeSet<usize>, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use tokio::sync::RwLock;
-
     use super::*;
     use crate::parser::LogFormat;
+    use crate::test_support::{add_channel, app_state, tempdir};
     use crate::{ChannelDir, ChannelNode};
 
     /// A `#c` channel whose directory has a `secret1.log` sibling.
@@ -1038,34 +1035,20 @@ mod tests {
         )
         .unwrap();
         let mut channels = ChannelNode::default();
-        channels
-            .children
-            .entry("#c".into())
-            .or_default()
-            .channel = Some(Channel {
-            name: "#c".into(),
-            path_segments: vec!["#c".into()],
-            dirs: vec![ChannelDir {
+        add_channel(
+            &mut channels,
+            &["#c"],
+            vec![ChannelDir {
                 path: dir,
                 format: LogFormat::Iso8601,
             }],
-        });
-        AppState {
-            config: serde_yaml::from_str("logs_dirs: []").unwrap(),
-            logs_dirs: Vec::new(),
-            channels,
-            sse_senders: RwLock::new(HashMap::new()),
-            ai_semaphore: None,
-            reqwest_client: None,
-        }
+        );
+        app_state(channels)
     }
 
     #[test]
     fn tools_cannot_read_outside_the_channel_dir() {
-        let root = tempfile::Builder::new()
-            .prefix("test-ai-")
-            .tempdir_in(concat!(env!("CARGO_MANIFEST_DIR"), "/target"))
-            .unwrap();
+        let root = tempdir();
         let state = state_with_secret_sibling(root.path());
         let date = "../secret1";
         let control = execute_search(
