@@ -1120,7 +1120,6 @@ mod tests {
 
 #[cfg(test)]
 mod limit_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::body::Body;
     use axum::http::Request;
@@ -1183,21 +1182,24 @@ mod limit_tests {
         (status, headers, String::from_utf8(body.to_vec()).unwrap())
     }
 
-    /// Stands in for the Messages API, always asking for one more display call.
-    async fn fake_api(hits: Arc<AtomicUsize>) -> String {
+    type Requests = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    /// Stands in for the Messages API: records each request body and answers
+    /// every one with `reply`.
+    async fn fake_api(reply: serde_json::Value) -> (String, Requests) {
+        let requests = Requests::default();
+        let recorded = Arc::clone(&requests);
         let api = Router::new().route(
             "/v1/messages",
-            post(move || {
-                let hits = Arc::clone(&hits);
+            post(move |body: String| {
+                let recorded = Arc::clone(&recorded);
+                let reply = reply.to_string();
                 async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    (
-                        [(header::CONTENT_TYPE, "application/json")],
-                        serde_json::json!({
-                        "stop_reason": "tool_use",
-                        "content": [{"type": "tool_use", "id": "t", "name": "display", "input": {"text": "x"}}],
-                    }).to_string(),
-                    )
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str(&body).unwrap());
+                    ([(header::CONTENT_TYPE, "application/json")], reply)
                 }
             }),
         );
@@ -1208,22 +1210,26 @@ mod limit_tests {
             .local_addr()
             .unwrap();
         tokio::spawn(async move { axum::serve(listener, api).await });
-        format!("http://{addr}/v1/messages")
+        (format!("http://{addr}/v1/messages"), requests)
     }
 
-    #[tokio::test]
-    async fn ask_sessions_stop_at_the_client_then_the_address_budget() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let (_logs, channels) = channel_with_logs(&[("2026-01-01", "hi")]);
-        let out = tempdir();
+    /// Always asks for one more display call, so a session runs until stopped.
+    fn display_reply() -> serde_json::Value {
+        serde_json::json!({
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "t", "name": "display", "input": {"text": "x"}}],
+        })
+    }
+
+    /// The router with AI enabled against `api_url`; `ai_extra` adds keys to the ai section.
+    fn ask_app(api_url: String, out: &Path, ai_extra: &str) -> Router {
+        let (_logs, channels) = channel_with_logs(&[]);
         let yaml = format!(
-            "{{logs_dirs: [], ai: {{api_key: k, output_dir: '{}', requests_per_day_per_client: 3, \
-             requests_per_day_per_ip: 5}}}}",
-            out.path()
-                .display()
+            "{{logs_dirs: [], ai: {{api_key: k, output_dir: '{}'{ai_extra}}}}}",
+            out.display()
         );
         let mut state = app_state(channels, &yaml);
-        state.api_url = fake_api(Arc::clone(&hits)).await;
+        state.api_url = api_url;
         crate::install_crypto_provider();
         // Its own client: the proxy variables of the test environment must not
         // route a loopback request.
@@ -1234,22 +1240,89 @@ mod limit_tests {
                 .unwrap(),
         );
         state.ai_semaphore = Some(Arc::new(Semaphore::new(1)));
-        let app = app(Arc::new(state), PEER);
-        let a = format!("{}=000000000000000000000000000000aa", limits::ASK_COOKIE);
-        let b = format!("{}=000000000000000000000000000000bb", limits::ASK_COOKIE);
-        let ask = "/%23c/ask/stream?q=x";
+        app(Arc::new(state), PEER)
+    }
 
-        let (_, _, body) = get(&app, ask, &[("cookie", &a)]).await;
+    const ASK: &str = "/%23c/ask/stream?q=x";
+
+    fn cookie(suffix: &str) -> String {
+        format!(
+            "{}=0000000000000000000000000000{suffix}",
+            limits::ASK_COOKIE
+        )
+    }
+
+    #[tokio::test]
+    async fn ask_sessions_stop_at_the_client_then_the_address_budget() {
+        let (url, requests) = fake_api(display_reply()).await;
+        let out = tempdir();
+        let app = ask_app(
+            url,
+            out.path(),
+            ", requests_per_day_per_client: 3, requests_per_day_per_ip: 5",
+        );
+        let hits = || {
+            requests
+                .lock()
+                .unwrap()
+                .len()
+        };
+
+        let (_, _, body) = get(&app, ASK, &[("cookie", &cookie("00aa"))]).await;
         assert!(body.contains("used up for this browser"), "{body}");
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(hits(), 3);
 
-        let (_, _, body) = get(&app, ask, &[("cookie", &b)]).await;
+        let (_, _, body) = get(&app, ASK, &[("cookie", &cookie("00bb"))]).await;
         assert!(body.contains("used up for your address"), "{body}");
-        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert_eq!(hits(), 5);
 
-        let (_, _, body) = get(&app, ask, &[]).await;
+        let (_, _, body) = get(&app, ASK, &[]).await;
         assert!(body.contains("missing ask_id cookie"), "{body}");
-        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert_eq!(hits(), 5);
+    }
+
+    #[tokio::test]
+    async fn ask_requests_only_append_to_the_conversation() {
+        let (url, requests) = fake_api(display_reply()).await;
+        let out = tempdir();
+        let app = ask_app(url, out.path(), ", max_tool_calls: 4");
+        get(&app, ASK, &[("cookie", &cookie("00cc"))]).await;
+
+        let requests = requests
+            .lock()
+            .unwrap();
+        assert_eq!(requests.len(), 4);
+        for pair in requests.windows(2) {
+            let before = pair[0]["messages"]
+                .as_array()
+                .unwrap();
+            let after = pair[1]["messages"]
+                .as_array()
+                .unwrap();
+            assert_eq!(
+                &after[..before.len()],
+                &before[..],
+                "an earlier message changed"
+            );
+            assert_eq!(pair[0]["system"], pair[1]["system"]);
+            assert_eq!(pair[0]["tools"], pair[1]["tools"]);
+        }
+        assert_eq!(requests[0]["model"], "claude-haiku-5-5");
+        assert_eq!(requests[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_reaches_the_page_with_its_category() {
+        let (url, _) = fake_api(serde_json::json!({
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+            "content": [],
+        }))
+        .await;
+        let out = tempdir();
+        let app = ask_app(url, out.path(), "");
+        let (_, _, body) = get(&app, ASK, &[("cookie", &cookie("00dd"))]).await;
+        assert!(body.contains("declined this question (cyber)"), "{body}");
     }
 
     #[tokio::test]

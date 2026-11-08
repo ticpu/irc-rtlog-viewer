@@ -76,7 +76,7 @@ fn default_search_limit() -> usize {
     10000
 }
 fn default_ai_model() -> String {
-    "claude-haiku-4-5-20251001".into()
+    "claude-haiku-5-5".into()
 }
 fn default_ai_max_concurrent() -> usize {
     1
@@ -296,7 +296,7 @@ async fn run() {
             "#base_path: /irc\n",
             "#ai:\n",
             "#  api_key: sk-ant-api03-...\n",
-            "#  model: claude-haiku-4-5-20251001\n",
+            "#  model: claude-haiku-5-5\n",
             "#  output_dir: /var/lib/irc-logs/ask\n",
             "#  max_concurrent: 1\n",
             "#  max_tool_calls: 100\n",

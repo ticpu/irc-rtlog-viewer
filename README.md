@@ -47,7 +47,7 @@ search:
   max_days: 365
 ai:
   api_key: sk-ant-api03-...
-  model: claude-haiku-4-5-20251001
+  model: claude-haiku-5-5
   output_dir: /var/lib/irc-logs/ask
   max_concurrent: 1
   max_tool_calls: 100
@@ -96,7 +96,7 @@ The `ai` section is optional. When omitted, the "ask" feature is disabled and no
 | Option | Default | Description |
 |--------|---------|-------------|
 | `ai.api_key` | *(required)* | Anthropic API key |
-| `ai.model` | `claude-haiku-4-5-20251001` | Model ID to use |
+| `ai.model` | `claude-haiku-5-5` | Model ID to use |
 | `ai.output_dir` | *(required)* | Directory where output markdown files are written |
 | `ai.max_concurrent` | `1` | Maximum concurrent AI sessions; a further ask is refused with a message on the page |
 | `ai.max_tool_calls` | `100` | Maximum API round-trips per session before stopping |

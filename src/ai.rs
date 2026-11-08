@@ -11,6 +11,10 @@ use crate::parser::parse_line;
 use crate::server::{channel_dates, read_log_file, resolve_log_path};
 
 pub const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+/// Room for adaptive thinking, which counts toward it, plus one tool call or answer.
+const MAX_RESPONSE_TOKENS: u32 = 16_000;
+/// Haiku 5.5's default, sent explicitly so a model change does not shift it.
+const EFFORT: &str = "medium";
 
 /// Who an ask session bills its Anthropic requests to.
 pub struct AskClient {
@@ -689,9 +693,8 @@ pub async fn run_ai_session(
         ),
     })];
 
-    // Put cache_control on the last tool so tools+system prefix can be cached.
-    // Haiku 4.5 requires 4096 tokens minimum; the prefix will only be cached
-    // once the conversation grows past that threshold.
+    // The tools+system prefix is the same for every session; the top-level
+    // cache_control below covers the growing conversation.
     let mut tools = tools;
     if let Some(last_tool) = tools.last_mut() {
         last_tool["cache_control"] = json!({"type": "ephemeral"});
@@ -726,38 +729,13 @@ pub async fn run_ai_session(
             break;
         }
 
-        // Move cache_control to the last message so the growing conversation
-        // prefix gets cached. Clear old markers first (max 4 breakpoints allowed).
-        for msg in messages.iter_mut() {
-            if let Some(content) = msg["content"].as_array_mut() {
-                for block in content.iter_mut() {
-                    if let Some(obj) = block.as_object_mut() {
-                        obj.remove("cache_control");
-                    }
-                }
-            }
-        }
-        if let Some(last_msg) = messages.last_mut() {
-            if let Some(content) = last_msg["content"].as_array_mut() {
-                if let Some(last_block) = content.last_mut() {
-                    last_block["cache_control"] = json!({"type": "ephemeral"});
-                }
-            } else if last_msg["content"].is_string() {
-                let text = last_msg["content"]
-                    .as_str()
-                    .unwrap()
-                    .to_string();
-                last_msg["content"] = json!([{
-                    "type": "text",
-                    "text": text,
-                    "cache_control": {"type": "ephemeral"},
-                }]);
-            }
-        }
-
+        // Earlier messages are never edited: Haiku 5.5 rejects replayed thinking
+        // blocks once anything before them changes.
         let body = json!({
             "model": model,
-            "max_tokens": 4096,
+            "max_tokens": MAX_RESPONSE_TOKENS,
+            "output_config": {"effort": EFFORT},
+            "cache_control": {"type": "ephemeral"},
             "system": [{
                 "type": "text",
                 "text": system_prompt,
@@ -945,9 +923,18 @@ pub async fn run_ai_session(
                 break;
             }
         } else {
-            let _ = tx.send(SseEvent::Error(format!(
-                "unexpected stop_reason: {stop_reason}"
-            )));
+            let msg = match stop_reason {
+                "refusal" => format!(
+                    "the model declined this question ({})",
+                    resp_json["stop_details"]["category"]
+                        .as_str()
+                        .unwrap_or("no category given")
+                ),
+                "max_tokens" => format!("the model's reply exceeded {MAX_RESPONSE_TOKENS} tokens"),
+                other => format!("unexpected stop_reason: {other}"),
+            };
+            eprintln!("ai: session stopped: {msg}");
+            let _ = tx.send(SseEvent::Error(msg));
             break;
         }
     }
