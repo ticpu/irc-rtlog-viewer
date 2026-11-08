@@ -86,13 +86,16 @@ fn parse_time(s: &str) -> Option<Time> {
     if s.len() < 8 {
         return None;
     }
-    let hour = s[0..2]
+    let hour = s
+        .get(0..2)?
         .parse()
         .ok()?;
-    let minute = s[3..5]
+    let minute = s
+        .get(3..5)?
         .parse()
         .ok()?;
-    let second = s[6..8]
+    let second = s
+        .get(6..8)?
         .parse()
         .ok()?;
     Some(Time {
@@ -115,8 +118,8 @@ fn parse_iso8601(line: &str) -> Option<LogLine> {
     if line.len() < 21 {
         return None;
     }
-    let time = parse_time(&line[11..19])?;
-    let rest = &line[21..]; // skip "YYYY-MM-DDTHH:MM:SSZ "
+    let time = parse_time(line.get(11..19)?)?;
+    let rest = line.get(21..)?; // skip "YYYY-MM-DDTHH:MM:SSZ "
 
     if let Some(rest) = rest.strip_prefix('<') {
         let end = rest.find('>')?;
@@ -148,8 +151,8 @@ fn parse_znc(line: &str) -> Option<LogLine> {
     if line.len() < 11 || !line.starts_with('[') {
         return None;
     }
-    let time = parse_time(&line[1..9])?;
-    let rest = &line[11..]; // skip "[HH:MM:SS] "
+    let time = parse_time(line.get(1..9)?)?;
+    let rest = line.get(11..)?; // skip "[HH:MM:SS] "
 
     if let Some(rest) = rest.strip_prefix('<') {
         let end = rest.find('>')?;
@@ -242,6 +245,24 @@ fn parse_quit_or_part(time: Time, rest: &str, is_quit: bool) -> Option<LogLine> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_multibyte_in_timestamp_is_rejected() {
+        for line in [
+            "2025-02-01T12:1\u{e9}:17Z <a> b",
+            "2025-02-01T\u{e9}2:18:1 <a> b",
+            "2025-02-01T12:18:17Z\u{e9}<a> b",
+        ] {
+            assert_eq!(parse_line(line, LogFormat::Iso8601), None, "{line}");
+        }
+        for line in [
+            "[12:3\u{e9}:56] <a> b",
+            "[12:34:5\u{e9}] <a> b",
+            "[12:34:56]\u{e9}<a> b",
+        ] {
+            assert_eq!(parse_line(line, LogFormat::Znc), None, "{line}");
+        }
+    }
 
     #[test]
     fn test_detect_format() {
