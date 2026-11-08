@@ -62,7 +62,7 @@ ai:
 
 Each path in `logs_dirs` is scanned recursively. Channels are identified by directories containing `YYYY-MM-DD.log` or `YYYY-MM-DD.log.zst` files. The directory tree structure becomes the channel path (e.g. `logs/OFTC/#channel/` becomes `OFTC/#channel`).
 
-When sibling directories include any `#`-prefixed name, non-`#` directories are filtered out (this excludes ZNC private query logs).
+Only directories whose name starts with `#` become channels; anything else, such as a ZNC private query log, is never served or searched.
 
 Multiple `logs_dirs` entries are merged: if the same channel path exists in multiple directories, their logs are combined.
 

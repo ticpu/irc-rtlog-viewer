@@ -63,23 +63,18 @@ fn build_system_prompt(state: &AppState) -> String {
 
 fn collect_channels(node: &crate::ChannelNode, out: &mut String) {
     if let Some(channel) = &node.channel {
-        if channel
-            .name
-            .starts_with('#')
-        {
-            let path = channel
-                .path_segments
-                .join("/");
-            let dates = channel_dates(channel);
-            if let (Some(first), Some(last)) = (dates.first(), dates.last()) {
-                out.push_str(&format!(
-                    "- {} ({} to {}, {} files)\n",
-                    path,
-                    first,
-                    last,
-                    dates.len()
-                ));
-            }
+        let path = channel
+            .path_segments
+            .join("/");
+        let dates = channel_dates(channel);
+        if let (Some(first), Some(last)) = (dates.first(), dates.last()) {
+            out.push_str(&format!(
+                "- {} ({} to {}, {} files)\n",
+                path,
+                first,
+                last,
+                dates.len()
+            ));
         }
     }
     for child in node
@@ -248,14 +243,7 @@ fn validate_channel<'a>(
         }
     }
     match &node.channel {
-        Some(ch)
-            if ch
-                .name
-                .starts_with('#') =>
-        {
-            Ok(ch)
-        }
-        Some(_) => Err(format!("channel not accessible: {channel_path}")),
+        Some(ch) => Ok(ch),
         None => Err(format!("not a channel: {channel_path}")),
     }
 }

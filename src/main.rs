@@ -340,7 +340,7 @@ fn discover_channels(dir: &Path, segments: &[String], root: &mut ChannelNode) {
         }
     }
 
-    if has_logs && !segments.is_empty() {
+    if has_logs && is_channel_dir(segments) {
         let format = detect_channel_format(dir);
         let channel_dir = ChannelDir {
             path: dir.to_path_buf(),
@@ -349,19 +349,19 @@ fn discover_channels(dir: &Path, segments: &[String], root: &mut ChannelNode) {
         insert_channel(root, segments, channel_dir);
     }
 
-    // If any sibling subdir starts with #, only recurse into #-prefixed dirs
-    // (filters out ZNC private query logs like "qwebirc56163")
-    let has_hash_sibling = subdirs
-        .iter()
-        .any(|(name, _)| name.starts_with('#'));
     for (name, path) in subdirs {
-        if has_hash_sibling && !name.starts_with('#') {
-            continue;
-        }
         let mut child_segments = segments.to_vec();
         child_segments.push(name);
         discover_channels(&path, &child_segments, root);
     }
+}
+
+/// Only `#` directories are published: anything else, such as a ZNC private
+/// query log, stays off the web and out of the AI tools.
+fn is_channel_dir(segments: &[String]) -> bool {
+    segments
+        .last()
+        .is_some_and(|name| name.starts_with('#'))
 }
 
 fn detect_channel_format(dir: &Path) -> LogFormat {
@@ -410,5 +410,43 @@ fn insert_channel(root: &mut ChannelNode, segments: &[String], dir: ChannelDir) 
             path_segments: segments.to_vec(),
             dirs: vec![dir],
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::tempdir;
+
+    #[test]
+    fn only_hash_directories_become_channels() {
+        let root = tempdir();
+        for dir in ["OFTC/#chan", "OFTC/somenick", "net2/qwebirc56163", "#top"] {
+            let path = root
+                .path()
+                .join(dir);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("2026-01-01.log"), "").unwrap();
+        }
+        let mut tree = ChannelNode::default();
+        discover_channels(root.path(), &[], &mut tree);
+
+        let mut found = Vec::new();
+        let mut stack = vec![&tree];
+        while let Some(node) = stack.pop() {
+            stack.extend(
+                node.children
+                    .values(),
+            );
+            if let Some(channel) = &node.channel {
+                found.push(
+                    channel
+                        .path_segments
+                        .join("/"),
+                );
+            }
+        }
+        found.sort();
+        assert_eq!(found, ["#top", "OFTC/#chan"]);
     }
 }
