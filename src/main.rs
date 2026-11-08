@@ -54,7 +54,7 @@ pub struct Config {
 }
 
 fn default_bind() -> String {
-    "0.0.0.0:8080".into()
+    "[::]:8080".into()
 }
 fn default_title() -> String {
     "IRC Logs".into()

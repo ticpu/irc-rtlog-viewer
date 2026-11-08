@@ -30,7 +30,7 @@ On first run, if the config file doesn't exist, a default one is created and the
 All configuration is in a single YAML file. Example with all options:
 
 ```yaml
-bind: 0.0.0.0:8080
+bind: "[::]:8080"
 title: IRC Logs
 search_limit: 10000
 base_path: /irc
@@ -52,7 +52,7 @@ ai:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `bind` | `0.0.0.0:8080` | Address and port to listen on |
+| `bind` | `[::]:8080` | Address and port to listen on; `[::]` accepts IPv4 too unless net.ipv6.bindv6only is set. Quote it in YAML. |
 | `title` | `IRC Logs` | Page title shown in the sidebar and browser tab |
 | `search_limit` | `10000` | Maximum number of lines to scan per channel during search |
 | `logs_dirs` | `[./logs]` | List of directories containing IRC log channels |
