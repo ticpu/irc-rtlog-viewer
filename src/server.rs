@@ -83,6 +83,7 @@ async fn wildcard(
     );
     let segments: Vec<&str> = path
         .split('/')
+        .filter(|s| !s.is_empty())
         .collect();
 
     if segments.is_empty() {
@@ -686,4 +687,92 @@ async fn serve_ask_output(
     }
 
     (StatusCode::BAD_REQUEST, "invalid filename").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::{Channel, ChannelNode};
+
+    fn state() -> Arc<AppState> {
+        let channel = ChannelNode {
+            channel: Some(Channel {
+                name: "#bcache".into(),
+                path_segments: vec!["OFTC".into(), "#bcache".into()],
+                dirs: Vec::new(),
+            }),
+            children: BTreeMap::new(),
+        };
+        let mut oftc = ChannelNode::default();
+        oftc.children
+            .insert("#bcache".into(), channel);
+        let mut root = ChannelNode::default();
+        root.children
+            .insert("OFTC".into(), oftc);
+        Arc::new(AppState {
+            config: serde_yaml::from_str("logs_dirs: []").unwrap(),
+            logs_dirs: Vec::new(),
+            channels: root,
+            sse_senders: RwLock::new(HashMap::new()),
+            ai_semaphore: None,
+            reqwest_client: None,
+        })
+    }
+
+    async fn get_status(uri: &str) -> (StatusCode, Option<String>) {
+        let resp = router()
+            .with_state(state())
+            .oneshot(
+                Request::get(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .map(|v| {
+                v.to_str()
+                    .unwrap()
+                    .to_owned()
+            });
+        (resp.status(), location)
+    }
+
+    #[tokio::test]
+    async fn bare_channel_redirects_with_or_without_trailing_slash() {
+        for uri in ["/OFTC/%23bcache", "/OFTC/%23bcache/"] {
+            let (status, location) = get_status(uri).await;
+            assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "{uri}");
+            let location = location.unwrap();
+            assert!(
+                location.starts_with("/OFTC/%23bcache/"),
+                "{uri} -> {location}"
+            );
+            assert!(
+                looks_like_date(&location["/OFTC/%23bcache/".len()..]),
+                "{uri} -> {location}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn today_resolves_with_trailing_slash() {
+        let (status, _) = get_status("/OFTC/%23bcache/today/").await;
+        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    }
+
+    #[tokio::test]
+    async fn unknown_channel_is_not_found() {
+        let (status, _) = get_status("/OFTC/%23nope/").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }

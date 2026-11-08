@@ -26,3 +26,6 @@ lto = true
 strip = true
 codegen-units = 1
 panic = "abort"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
