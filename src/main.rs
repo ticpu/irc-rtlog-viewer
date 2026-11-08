@@ -357,7 +357,7 @@ async fn run() {
         api_url: crate::ai::ANTHROPIC_MESSAGES_URL.to_owned(),
     });
 
-    tail::start_watcher(Arc::clone(&state));
+    let tail = tail::start_watcher(Arc::clone(&state));
     tokio::spawn(prune_limits(Arc::clone(&state)));
 
     let app = if state
@@ -390,6 +390,8 @@ async fn run() {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .unwrap();
+    // The tail thread holds no state; stopping it lets the runtime shut down.
+    drop(tail);
 }
 
 async fn prune_limits(state: Arc<AppState>) {
