@@ -163,14 +163,15 @@ pub fn page(title: &str, tree: &ChannelNode, base_path: &str, content: Markup) -
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 link rel="stylesheet" href=(format!("{base_path}/static/style.css"));
+                script src=(format!("{base_path}/static/app.js")) defer {}
             }
             body {
-                button id="sidebar-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')" { "☰" }
+                button id="sidebar-toggle" { "☰" }
                 nav id="sidebar" {
                     h2 { (title) }
                     (render_channel_tree(tree, "", base_path))
                 }
-                main onclick="document.getElementById('sidebar').classList.remove('open')" {
+                main {
                     (content)
                 }
             }
@@ -190,22 +191,6 @@ pub struct LogPageContext<'a> {
     pub ai_enabled: bool,
     pub base_path: &'a str,
 }
-
-const TOGGLE_EVENTS_JS: &str = r#"
-(function() {
-    var cb = document.getElementById('toggle-events');
-    var log = document.getElementById('log');
-    function apply() {
-        log.classList.toggle('hide-events', !cb.checked);
-    }
-    cb.checked = localStorage.getItem('hide-events') !== '1';
-    apply();
-    cb.addEventListener('change', function() {
-        localStorage.setItem('hide-events', cb.checked ? '0' : '1');
-        apply();
-    });
-})();
-"#;
 
 pub fn log_page(ctx: &LogPageContext) -> Markup {
     let title = ctx.title;
@@ -231,9 +216,7 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                         a href=(format!("{bp}/{encoded}/{prev}")) { "← " (prev) }
                     }
                     " "
-                    input type="date" value=(date)
-                        onchange="window.location.href=this.value"
-                        ;
+                    input id="date-picker" type="date" value=(date);
                     " "
                     @if let Some(next) = next_date {
                         a href=(format!("{bp}/{encoded}/{next}")) { (next) " →" }
@@ -260,30 +243,11 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     }
                 }
             }
-            div id="log" data-channel=(&encoded) {
+            div id="log" data-latest=[is_today.then(|| format!("{bp}/{encoded}/latest"))] {
                 @for line in lines {
                     (render_line(line))
                 }
             }
-            @if is_today {
-                script {
-                    (PreEscaped(format!(r#"
-(function() {{
-    var log = document.getElementById('log');
-    var src = new EventSource('{bp}/' + log.dataset.channel + '/latest');
-    var atBottom = true;
-    window.addEventListener('scroll', function() {{
-        atBottom = (window.innerHeight + window.scrollY) >= (document.body.offsetHeight - 50);
-    }});
-    src.onmessage = function(e) {{
-        log.insertAdjacentHTML('beforeend', e.data);
-        if (atBottom) window.scrollTo(0, document.body.scrollHeight);
-    }};
-}})();
-"#)))
-                }
-            }
-            script { (PreEscaped(TOGGLE_EVENTS_JS)) }
         },
     )
 }
@@ -381,98 +345,9 @@ pub fn ask_page(
                         maxlength=(max_query_len) autocomplete="off";
                     button type="submit" { "ask AI" }
                 }
-                div id="ask-links" style="display:none" {}
-                iframe id="ask-result" sandbox="" style="display:none" {}
+                div id="ask-links" hidden {}
+                iframe id="ask-result" sandbox="" hidden {}
                 div id="ask-log" {}
-            }
-            script {
-                (PreEscaped(r#"
-(function() {
-    var form = document.getElementById('ask-form');
-    var log = document.getElementById('ask-log');
-    var links = document.getElementById('ask-links');
-    var result = document.getElementById('ask-result');
-    var btn = form.querySelector('button');
-    var input = form.querySelector('input');
-    function setBusy(busy) {
-        btn.disabled = busy;
-        input.disabled = busy;
-        btn.textContent = busy ? 'working…' : 'ask AI';
-    }
-    form.onsubmit = function(e) {
-        e.preventDefault();
-        var q = input.value.trim();
-        if (!q) return;
-        setBusy(true);
-        log.innerHTML = '';
-        links.style.display = 'none';
-        links.innerHTML = '';
-        result.style.display = 'none';
-        result.innerHTML = '';
-        var src = new EventSource(form.dataset.stream + '?q=' + encodeURIComponent(q));
-        src.addEventListener('display', function(e) {
-            var d = JSON.parse(e.data);
-            var div = document.createElement('div');
-            div.className = 'ask-display';
-            div.textContent = d.text;
-            log.prepend(div);
-        });
-        src.addEventListener('tool_call', function(e) {
-            var d = JSON.parse(e.data);
-            var div = document.createElement('div');
-            div.className = 'ask-tool';
-            div.textContent = '> ' + d.name + '(' + d.input + ')';
-            log.prepend(div);
-        });
-        src.addEventListener('tool_result', function(e) {
-            var d = JSON.parse(e.data);
-            var pre = document.createElement('pre');
-            pre.className = 'ask-result-preview';
-            pre.textContent = d.output;
-            log.prepend(pre);
-            requestAnimationFrame(function() {
-                if (pre.scrollHeight > pre.clientHeight) {
-                    var btn = document.createElement('a');
-                    btn.className = 'ask-expand';
-                    btn.textContent = 'expand';
-                    btn.href = '#';
-                    btn.onclick = function(ev) {
-                        ev.preventDefault();
-                        var expanded = pre.classList.toggle('expanded');
-                        btn.textContent = expanded ? 'collapse' : 'expand';
-                    };
-                    pre.before(btn);
-                }
-            });
-        });
-        src.addEventListener('done', function(e) {
-            var d = JSON.parse(e.data);
-            links.style.display = 'block';
-            var a = document.createElement('a');
-            a.href = d.url;
-            a.textContent = d.url;
-            links.replaceChildren(a);
-            result.src = d.url;
-            result.style.display = 'block';
-            src.close();
-            setBusy(false);
-        });
-        src.addEventListener('ask_error', function(e) {
-            var d = JSON.parse(e.data);
-            var div = document.createElement('div');
-            div.className = 'ask-error';
-            div.textContent = d.error;
-            log.prepend(div);
-            src.close();
-            setBusy(false);
-        });
-        src.onerror = function() {
-            src.close();
-            setBusy(false);
-        };
-    };
-})();
-"#.to_string()))
             }
         },
     )
@@ -505,7 +380,7 @@ pub fn ask_output_page(title: &str, md_filename: &str, content: &str, base_path:
                 link rel="stylesheet" href=(format!("{base_path}/static/style.css"));
             }
             body {
-                main style="margin-left:0; max-width:800px; margin:0 auto; padding:1em; overflow-wrap:break-word; min-width:0; width:100%" {
+                main.standalone {
                     div.nav-links {
                         a href=(format!("{base_path}/ask/output/{md_filename}")) { "raw" }
                     }

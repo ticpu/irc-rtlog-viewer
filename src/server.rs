@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::middleware::map_response;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -20,6 +21,13 @@ use crate::search::search_channel;
 use crate::templates;
 
 static CSS: &str = include_str!("../static/style.css");
+static JS: &str = include_str!("../static/app.js");
+
+/// No inline script or handler anywhere; inline style attributes stay allowed for
+/// the per-nick colours. frame-src and frame-ancestors cover the ask result iframe.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+    style-src-attr 'unsafe-inline'; connect-src 'self'; frame-src 'self'; \
+    frame-ancestors 'self'; form-action 'self'; base-uri 'none'";
 
 fn cache_control(value: &str) -> (header::HeaderName, &str) {
     (header::CACHE_CONTROL, value)
@@ -29,8 +37,10 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(index))
         .route("/static/style.css", get(serve_css))
+        .route("/static/app.js", get(serve_js))
         .route("/ask/output/{filename}", get(serve_ask_output))
         .fallback(get(wildcard))
+        .layer(map_response(security_headers))
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> Response {
@@ -56,6 +66,29 @@ async fn index(State(state): State<Arc<AppState>>) -> Response {
                 .unwrap(),
         );
     resp
+}
+
+async fn security_headers(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp
+}
+
+async fn serve_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            cache_control("public, max-age=86400, s-maxage=604800"),
+        ],
+        JS,
+    )
 }
 
 async fn serve_css() -> impl IntoResponse {
@@ -906,6 +939,61 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(search.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pages_carry_security_headers_and_no_inline_script() {
+        let root = tempdir();
+        std::fs::write(
+            root.path()
+                .join("2026-01-01.log"),
+            "2026-01-01T00:00:00Z <a> hi\n",
+        )
+        .unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: root
+                .path()
+                .to_owned(),
+            format: LogFormat::Iso8601,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        let mut state = app_state(channels);
+        state
+            .config
+            .ai = Some(serde_yaml::from_str("{api_key: k, output_dir: /nonexistent}").unwrap());
+        let app = router().with_state(Arc::new(state));
+        let inline = regex::Regex::new(r"<script>|<script [^>]*>[^<]|\son[a-z]+=").unwrap();
+        for uri in [
+            "/",
+            "/%23c/2026-01-01",
+            "/%23c/search?q=hi",
+            "/%23c/ask",
+            "/static/app.js",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::get(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let headers = resp.headers();
+            assert_eq!(headers[header::CONTENT_SECURITY_POLICY], CSP, "{uri}");
+            assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{uri}");
+            if uri.ends_with(".js") {
+                continue;
+            }
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("/static/app.js"), "{uri}");
+            assert!(!inline.is_match(&body), "{uri}: {body}");
+        }
     }
 
     #[tokio::test]

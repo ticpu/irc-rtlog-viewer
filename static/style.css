@@ -213,6 +213,7 @@ main {
 .ask-expand { color: var(--accent); font-size: 0.9em; cursor: pointer; text-decoration: none; }
 .ask-expand:hover { text-decoration: underline; }
 .ask-error { color: #ff6b6b; }
+main.standalone { margin: 0 auto; max-width: 800px; padding: 1em; overflow-wrap: break-word; min-width: 0; width: 100%; }
 .ask-output { overflow-wrap: break-word; word-break: break-word; }
 .ask-output h1 { font-size: 1.4em; margin: 0.8em 0 0.4em; }
 .ask-output h2 { font-size: 1.2em; margin: 0.8em 0 0.4em; }
