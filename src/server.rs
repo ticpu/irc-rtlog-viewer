@@ -155,17 +155,16 @@ async fn wildcard(
                     let query = search
                         .q
                         .unwrap_or_default();
-                    serve_search(&state, &channel, &query).into_response()
+                    off_runtime(move || serve_search(&state, &channel, &query)).await
                 }
                 "ask" => serve_ask_page(&state, &channel).into_response(),
                 "raw" => {
-                    let date = segments[segments.len() - 2];
-                    serve_raw(&channel, date)
-                        .await
-                        .into_response()
+                    let date = segments[segments.len() - 2].to_owned();
+                    off_runtime(move || serve_raw(&channel, &date)).await
                 }
                 date if looks_like_date(date) => {
-                    serve_log_page(&state, &channel, date).into_response()
+                    let date = date.to_owned();
+                    off_runtime(move || serve_log_page(&state, &channel, &date)).await
                 }
                 _ => (StatusCode::NOT_FOUND, "not found").into_response(),
             };
@@ -183,6 +182,17 @@ async fn wildcard(
     }
 
     (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
+/// Runs file-reading work on the blocking pool: the runtime has one thread, which
+/// a scan over a channel's logs would otherwise hold against every request.
+async fn off_runtime(f: impl FnOnce() -> Response + Send + 'static) -> Response {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("blocking handler failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        })
 }
 
 fn is_date_raw(last: &str, len: usize) -> bool {
@@ -341,7 +351,7 @@ fn serve_search(state: &AppState, channel: &crate::Channel, query: &str) -> Resp
     resp
 }
 
-async fn serve_raw(channel: &crate::Channel, date: &str) -> Response {
+fn serve_raw(channel: &crate::Channel, date: &str) -> Response {
     let Some((path, _)) = resolve_log_path(channel, date) else {
         return (StatusCode::NOT_FOUND, format!("no log for {date}")).into_response();
     };
@@ -830,6 +840,72 @@ mod tests {
             let body = String::from_utf8(body.to_vec()).unwrap();
             assert!(body.contains("needle"), "{uri}: {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_search_does_not_block_other_requests() {
+        let root = tempdir();
+        let fifo = root
+            .path()
+            .join("2026-01-01.log");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: root
+                .path()
+                .to_owned(),
+            format: LogFormat::Iso8601,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        let app = router().with_state(Arc::new(app_state(channels)));
+
+        // Opening the FIFO blocks the search until this thread writes; on timeout it
+        // writes anyway so a blocked runtime fails the test instead of hanging it.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            let timed_out = released
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            std::fs::write(&fifo, "2026-01-01T00:00:00Z <a> x\n").unwrap();
+            timed_out
+        });
+
+        let search = tokio::spawn(
+            app.clone()
+                .oneshot(
+                    Request::get("/%23c/search?q=x")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+        );
+        tokio::task::yield_now().await;
+        let other = app
+            .oneshot(
+                Request::get("/%23c")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::TEMPORARY_REDIRECT);
+        // Fails only once the writer has timed out, which the join below reports.
+        let _ = release.send(());
+
+        assert!(
+            !writer
+                .join()
+                .unwrap(),
+            "runtime was blocked by the search"
+        );
+        let search = search
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(search.status(), StatusCode::OK);
     }
 
     #[tokio::test]

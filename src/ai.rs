@@ -821,7 +821,13 @@ pub async fn run_ai_session(
                 }
 
                 let result = match tool_name {
-                    "search" => execute_search(tool_input, &state),
+                    "search" => {
+                        let state = Arc::clone(&state);
+                        let input = tool_input.clone();
+                        tokio::task::spawn_blocking(move || execute_search(&input, &state))
+                            .await
+                            .unwrap_or_else(|e| format!("error: search failed: {e}"))
+                    }
                     "copy" => execute_copy(tool_input, &state, &mut output_buf),
                     "output" => execute_output(tool_input, &mut output_buf),
                     "done" => {
