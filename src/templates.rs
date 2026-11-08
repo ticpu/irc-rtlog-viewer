@@ -448,7 +448,10 @@ pub fn ask_page(
         src.addEventListener('done', function(e) {
             var d = JSON.parse(e.data);
             links.style.display = 'block';
-            links.innerHTML = '<a href="' + d.url + '">' + d.url + '</a>';
+            var a = document.createElement('a');
+            a.href = d.url;
+            a.textContent = d.url;
+            links.replaceChildren(a);
             result.src = d.url;
             result.style.display = 'block';
             src.close();

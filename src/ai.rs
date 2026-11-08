@@ -705,7 +705,7 @@ pub async fn run_ai_session(
 
         if !status.is_success() {
             eprintln!("ai: API error {status}: {resp_text}");
-            let _ = tx.send(SseEvent::Error(format!("API error {status}: {resp_text}")));
+            let _ = tx.send(SseEvent::Error(format!("API error {status}")));
             break;
         }
 
