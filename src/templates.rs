@@ -259,9 +259,19 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     a href=(format!("{bp}/{encoded}/{date}/raw")) { "raw" }
                 }
                 div.controls {
+                    label title="Shows whether each nick is online now, not at the time of the line." {
+                        input id="toggle-live" type="checkbox" checked;
+                        " live status"
+                    }
+                    " "
                     label {
-                        input id="toggle-events" type="checkbox" checked;
+                        input id="toggle-events" type="checkbox";
                         " show events"
+                    }
+                    " "
+                    label title="Loads images, videos and YouTube players from the linked sites, which then see your address." {
+                        input id="toggle-embeds" type="checkbox";
+                        " show embeds"
                     }
                     " "
                     form.search-form action=(format!("{bp}/{encoded}/search")) method="get" {
@@ -275,7 +285,7 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     }
                 }
             }
-            div id="log" data-latest=[is_today.then(|| format!("{bp}/{encoded}/latest"))] {
+            div id="log" class="hide-events" data-latest=[is_today.then(|| format!("{bp}/{encoded}/latest"))] {
                 @for line in lines {
                     (render_line(line))
                 }

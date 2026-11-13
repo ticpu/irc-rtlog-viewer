@@ -1,6 +1,7 @@
 // Page behaviour, kept out of the HTML so the Content-Security-Policy can
 // forbid inline script. Each block runs only on pages carrying its element;
-// URLs come from data attributes the server fills in.
+// URLs come from data attributes the server fills in. Embed URLs come from IRC
+// lines, so embeds are built with createElement, never from an HTML string.
 (function() {
     'use strict';
 
@@ -22,17 +23,116 @@
         });
     }
 
+    var bindToggle = function(id, key, fallback, apply) {
+        var box = document.getElementById(id);
+        if (!box) return null;
+        var stored = localStorage.getItem(key);
+        box.checked = stored === null ? fallback : stored === '1';
+        apply(box.checked);
+        box.addEventListener('change', function() {
+            localStorage.setItem(key, box.checked ? '1' : '0');
+            apply(box.checked);
+        });
+        return box;
+    };
+
+    var IMAGE = /\.(png|jpe?g|gif|webp)$/i;
+    var VIDEO = /\.(mp4|webm)$/i;
+    var YOUTUBE_ID = /^[A-Za-z0-9_-]{11}$/;
+    var YOUTUBE_HOSTS = ['youtube.com', 'www.youtube.com', 'm.youtube.com'];
+
+    var youtubeId = function(url) {
+        var id = null;
+        if (url.hostname === 'youtu.be') {
+            id = url.pathname.slice(1);
+        } else if (YOUTUBE_HOSTS.indexOf(url.hostname) !== -1) {
+            if (url.pathname === '/watch') {
+                id = url.searchParams.get('v');
+            } else if (url.pathname.indexOf('/shorts/') === 0) {
+                id = url.pathname.slice('/shorts/'.length);
+            }
+        }
+        return id !== null && YOUTUBE_ID.test(id) ? id : null;
+    };
+
+    var embedFor = function(href) {
+        var url;
+        try {
+            url = new URL(href);
+        } catch (e) {
+            return null;
+        }
+        if (url.protocol !== 'https:') return null;
+        var el;
+        var src = url.href;
+        var id = youtubeId(url);
+        if (id) {
+            el = document.createElement('iframe');
+            el.className = 'embed-youtube';
+            el.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-presentation');
+            el.setAttribute('allow', 'fullscreen');
+            el.setAttribute('loading', 'lazy');
+            src = 'https://www.youtube-nocookie.com/embed/' + id;
+            // The player refuses to load without a Referer (error 153); send the origin only.
+            el.referrerPolicy = 'strict-origin-when-cross-origin';
+        } else if (IMAGE.test(url.pathname)) {
+            el = document.createElement('img');
+            el.setAttribute('loading', 'lazy');
+            el.referrerPolicy = 'no-referrer';
+        } else if (VIDEO.test(url.pathname)) {
+            el = document.createElement('video');
+            el.controls = true;
+            el.preload = 'metadata';
+            el.referrerPolicy = 'no-referrer';
+        } else {
+            return null;
+        }
+        el.src = src;
+        return el;
+    };
+
+    var embedLine = function(line) {
+        if (line.hasAttribute('data-embedded')) return;
+        line.setAttribute('data-embedded', '');
+        var box = document.createElement('div');
+        box.className = 'embeds';
+        var links = line.querySelectorAll('span.msg a[href], span.action a[href]');
+        for (var i = 0; i < links.length; i++) {
+            var el = embedFor(links[i].getAttribute('href'));
+            if (el) box.appendChild(el);
+        }
+        if (box.firstChild) line.appendChild(box);
+    };
+
+    var unembedLine = function(line) {
+        line.removeAttribute('data-embedded');
+        var box = line.querySelector('div.embeds');
+        if (box) box.remove();
+    };
+
     var log = document.getElementById('log');
-    var events = document.getElementById('toggle-events');
-    if (log && events) {
-        var applyEvents = function() {
-            log.classList.toggle('hide-events', !events.checked);
-        };
-        events.checked = localStorage.getItem('hide-events') !== '1';
-        applyEvents();
-        events.addEventListener('change', function() {
-            localStorage.setItem('hide-events', events.checked ? '0' : '1');
-            applyEvents();
+    var embeds = null;
+    if (log) {
+        var legacy = localStorage.getItem('hide-events');
+        if (legacy !== null) {
+            if (localStorage.getItem('show-events') === null) {
+                localStorage.setItem('show-events', legacy === '1' ? '0' : '1');
+            }
+            localStorage.removeItem('hide-events');
+        }
+        bindToggle('toggle-live', 'live-status', true, function() {});
+        bindToggle('toggle-events', 'show-events', false, function(on) {
+            log.classList.toggle('hide-events', !on);
+        });
+        embeds = bindToggle('toggle-embeds', 'show-embeds', false, function(on) {
+            var lines = log.querySelectorAll(on ? '.line' : '.line[data-embedded]');
+            for (var i = 0; i < lines.length; i++) {
+                if (on) {
+                    embedLine(lines[i]);
+                } else {
+                    unembedLine(lines[i]);
+                }
+            }
         });
     }
 
@@ -44,6 +144,10 @@
         });
         tail.onmessage = function(e) {
             log.insertAdjacentHTML('beforeend', e.data);
+            var added = log.lastElementChild;
+            if (embeds && embeds.checked && added && added.classList.contains('line')) {
+                embedLine(added);
+            }
             if (atBottom) window.scrollTo(0, document.body.scrollHeight);
         };
     }

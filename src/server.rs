@@ -30,9 +30,20 @@ static JS: &str = include_str!("../static/app.js");
 
 /// No inline script or handler anywhere; inline style attributes stay allowed for
 /// the per-nick colours. frame-src and frame-ancestors cover the ask result iframe.
+///
+/// CSP is the default for every response. Log pages send LOG_PAGE_CSP instead,
+/// which adds https: images and media and the youtube-nocookie player for the
+/// embeds app.js builds once the viewer turns them on. Ask output stays on CSP:
+/// its markdown embeds verbatim IRC lines, and an attacker-chosen image there
+/// would load without the viewer opting in.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
     style-src-attr 'unsafe-inline'; connect-src 'self'; frame-src 'self'; \
     frame-ancestors 'self'; form-action 'self'; base-uri 'none'";
+const LOG_PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+    style-src-attr 'unsafe-inline'; connect-src 'self'; \
+    frame-src 'self' https://www.youtube-nocookie.com; \
+    frame-ancestors 'self'; form-action 'self'; base-uri 'none'; \
+    img-src 'self' https:; media-src https:";
 
 fn cache_control(value: &str) -> (header::HeaderName, &str) {
     (header::CACHE_CONTROL, value)
@@ -75,10 +86,9 @@ async fn index(State(state): State<Arc<AppState>>) -> Response {
 
 async fn security_headers(mut resp: Response) -> Response {
     let headers = resp.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP),
-    );
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(CSP));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -416,12 +426,16 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
     } else {
         "public, max-age=3600, s-maxage=86400"
     };
-    resp.headers_mut()
-        .insert(
-            header::CACHE_CONTROL,
-            cc.parse()
-                .unwrap(),
-        );
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        cc.parse()
+            .unwrap(),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(LOG_PAGE_CSP),
+    );
     resp
 }
 
@@ -1073,18 +1087,30 @@ mod tests {
             format: LogFormat::Iso8601,
         }];
         add_channel(&mut channels, &["#c"], dirs);
+        let out = tempdir();
+        std::fs::write(
+            out.path()
+                .join("x.md"),
+            "# answer\n",
+        )
+        .unwrap();
         let state = app_state(
             channels,
-            "{logs_dirs: [], ai: {api_key: k, output_dir: /nonexistent}}",
+            &format!(
+                "{{logs_dirs: [], ai: {{api_key: k, output_dir: '{}'}}}}",
+                out.path()
+                    .display()
+            ),
         );
         let app = app(Arc::new(state), PEER);
         let inline = regex::Regex::new(r"<script>|<script [^>]*>[^<]|\son[a-z]+=").unwrap();
-        for uri in [
-            "/",
-            "/%23c/2026-01-01",
-            "/%23c/search?q=hi",
-            "/%23c/ask",
-            "/static/app.js",
+        for (uri, csp) in [
+            ("/", CSP),
+            ("/%23c/2026-01-01", LOG_PAGE_CSP),
+            ("/%23c/search?q=hi", CSP),
+            ("/%23c/ask", CSP),
+            ("/ask/output/x.html", CSP),
+            ("/static/app.js", CSP),
         ] {
             let resp = app
                 .clone()
@@ -1097,7 +1123,7 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{uri}");
             let headers = resp.headers();
-            assert_eq!(headers[header::CONTENT_SECURITY_POLICY], CSP, "{uri}");
+            assert_eq!(headers[header::CONTENT_SECURITY_POLICY], csp, "{uri}");
             assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{uri}");
             if uri.ends_with(".js") {
                 continue;
@@ -1106,9 +1132,36 @@ mod tests {
                 .await
                 .unwrap();
             let body = String::from_utf8(body.to_vec()).unwrap();
-            assert!(body.contains("/static/app.js"), "{uri}");
+            if !uri.starts_with("/ask/output/") {
+                assert!(body.contains("/static/app.js"), "{uri}");
+            }
             assert!(!inline.is_match(&body), "{uri}: {body}");
+            if csp == LOG_PAGE_CSP {
+                assert_log_page_toggles(&body);
+            }
         }
+    }
+
+    fn assert_log_page_toggles(body: &str) {
+        let toggle = |id: &str| {
+            let start = body
+                .find(&format!(r#"<input id="{id}""#))
+                .unwrap_or_else(|| panic!("{id} missing: {body}"));
+            let end = start
+                + body[start..]
+                    .find('>')
+                    .unwrap();
+            (start, body[start..end].contains(" checked"))
+        };
+        let live = toggle("toggle-live");
+        let events = toggle("toggle-events");
+        let embeds = toggle("toggle-embeds");
+        assert!(live.0 < events.0 && events.0 < embeds.0, "{body}");
+        assert_eq!((live.1, events.1, embeds.1), (true, false, false), "{body}");
+        assert!(
+            body.contains(r#"<div id="log" class="hide-events""#),
+            "{body}"
+        );
     }
 
     #[tokio::test]
