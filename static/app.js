@@ -120,7 +120,9 @@
             }
             localStorage.removeItem('hide-events');
         }
-        bindToggle('toggle-live', 'live-status', true, function() {});
+        bindToggle('toggle-live', 'live-status', true, function(on) {
+            log.classList.toggle('hide-live', !on);
+        });
         bindToggle('toggle-events', 'show-events', false, function(on) {
             log.classList.toggle('hide-events', !on);
         });
@@ -154,6 +156,8 @@
         var users = {};
         var topic = null;
         var scanning = true;
+        var snapshotAt = null;
+        var stale = false;
         var stampFormat = null;
 
         var useZone = function(zone) {
@@ -170,19 +174,52 @@
         var when = function(stamp) {
             return stampFormat.format(new Date(stamp));
         };
+        // In the channel now: true or false with a ZNC snapshot, null without one.
+        var liveOf = function(user) {
+            if (snapshotAt === null) return null;
+            return user ? user.live === true : false;
+        };
         var hoverText = function(nick) {
             var user = users[casemap(nick)];
-            if (!user) return scanning ? 'archive scan in progress' : 'not seen in the archive';
             var lines = [];
-            if (user.online) lines.push('last online: ' + when(user.online));
-            if (user.offline) lines.push('last offline: ' + when(user.offline));
-            if (user.spoke) lines.push('last spoke: ' + when(user.spoke));
+            var live = liveOf(user);
+            if (live !== null) {
+                lines.push((live ? 'in the channel now' : 'not in the channel now') +
+                    (stale ? ' (as of ' + when(snapshotAt) + ', may be out of date)' : ''));
+            }
+            if (!user) {
+                lines.push(scanning ? 'archive scan in progress' : 'not seen in the archive');
+            } else {
+                if (user.online) lines.push('last online: ' + when(user.online));
+                if (user.offline) lines.push('last offline: ' + when(user.offline));
+                if (user.spoke) lines.push('last spoke: ' + when(user.spoke));
+            }
             return lines.join('\n');
+        };
+        // A dot and the member prefixes, placed just before the nick.
+        var mark = function(nickEl, user, title) {
+            var marker = nickEl.previousElementSibling;
+            if (!marker || !marker.classList.contains('presence')) marker = null;
+            var live = liveOf(user);
+            if (live === null) {
+                if (marker) marker.remove();
+                return;
+            }
+            if (!marker) {
+                marker = document.createElement('span');
+                nickEl.before(marker);
+            }
+            marker.className = 'presence ' + (live ? 'online' : 'offline') + (stale ? ' stale' : '');
+            marker.textContent = (live ? '●' : '○') + (live && user.prefixes ? user.prefixes : '');
+            marker.title = title;
         };
         var decorate = function(root) {
             var nicks = root.querySelectorAll('span.nick[data-nick]');
             for (var i = 0; i < nicks.length; i++) {
-                nicks[i].title = hoverText(nicks[i].getAttribute('data-nick'));
+                var nick = nicks[i].getAttribute('data-nick');
+                var title = hoverText(nick);
+                nicks[i].title = title;
+                mark(nicks[i], users[casemap(nick)], title);
             }
         };
         var showTopic = function() {
@@ -251,6 +288,8 @@
                 });
                 topic = body.topic;
                 scanning = body.scanning;
+                snapshotAt = body.snapshot_at;
+                stale = body.stale;
                 render();
                 if (scanning) schedule(5000);
             }).catch(function(e) {

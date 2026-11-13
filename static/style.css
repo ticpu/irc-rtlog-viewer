@@ -127,6 +127,16 @@ main {
     max-width: 14em;
 }
 
+.presence {
+    font-size: 0.8em;
+    margin-right: 0.25em;
+}
+
+.presence.online { color: #4caf50; }
+.presence.offline { color: var(--fg-dim); }
+.presence.stale { opacity: 0.5; }
+#log.hide-live .presence { display: none; }
+
 .search-form {
     display: inline-flex;
     gap: 0.3em;
