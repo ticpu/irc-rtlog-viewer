@@ -12,7 +12,7 @@ maud = { version = "0.27", features = ["axum"] }
 notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "2.1"
-tokio = { version = "1", features = ["rt", "macros", "fs", "sync", "net", "signal", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "fs", "sync", "net", "signal", "time", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 percent-encoding = "2"
 governor = { version = "0.10", default-features = false, features = ["std", "dashmap", "quanta"] }
@@ -27,6 +27,11 @@ zstd = "0.14"
 jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-zoneinfo", "serde"] }
 arc-swap = "1"
 tempfile = "3"
+irc-proto = { version = "1", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+base64 = "0.23"
+thiserror = "2"
+ring = "0.17"
 
 [profile.release]
 opt-level = "s"
@@ -36,4 +41,5 @@ codegen-units = 1
 panic = "abort"
 
 [dev-dependencies]
+rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }

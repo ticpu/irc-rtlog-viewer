@@ -799,6 +799,14 @@ struct ScanChannel {
     dirs: Vec<ChannelDir>,
 }
 
+/// The key of every channel in the tree, as presence and the endpoint use them.
+pub fn channel_keys(root: &ChannelNode) -> Vec<String> {
+    scan_channels(root)
+        .into_iter()
+        .map(|c| c.key)
+        .collect()
+}
+
 fn scan_channels(root: &ChannelNode) -> Vec<ScanChannel> {
     let mut found = Vec::new();
     let mut stack = vec![root];

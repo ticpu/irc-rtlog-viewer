@@ -1,7 +1,10 @@
 //! Streams lines appended to channel logs to SSE viewers and to presence.
 //!
 //! Each batch of new lines is parsed once and fed to presence before the
-//! SSE sender lookup, so stamps advance with no viewer subscribed.
+//! SSE sender lookup, so stamps advance with no viewer subscribed. With a
+//! `znc:` section, joins in the network's channels and "Connected to IRC"
+//! lines of its `status/` window, which is never served, go to the ZNC
+//! session runner as triggers.
 //!
 //! Offsets start at every file's current end, ZNC `status/` files beside
 //! the channel directories included: lines already on disk reach viewers
@@ -14,9 +17,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::parser::{LogFormat, LogLine, parse_line};
+use crate::parser::{LineKind, LogFormat, LogLine, parse_line};
 use crate::presence::{LiveClock, Presence};
 use crate::templates::render_line;
+use crate::znc::{Trigger, is_connected_line};
 use crate::{AppState, ChannelNode};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
@@ -63,6 +67,25 @@ fn tail_loop(
                 continue;
             }
 
+            if let Some(znc) = &state.znc {
+                if dir_segments(path, state).is_some_and(|segments| znc.is_status_dir(&segments)) {
+                    match offsets.new_lines(path) {
+                        Ok(lines)
+                            if lines
+                                .lines()
+                                .any(is_connected_line) =>
+                        {
+                            znc.trigger(Trigger::Connected);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("tail: cannot read new lines of {}: {e}", path.display());
+                        }
+                    }
+                    continue;
+                }
+            }
+
             let Some((channel_key, format)) = resolve_channel(path, state) else {
                 continue;
             };
@@ -85,6 +108,17 @@ fn tail_loop(
             if let Some((presence, clock)) = live.as_mut() {
                 if let Some(stamped) = clock.stamp(path, format, &parsed) {
                     presence.feed(channel_key.clone(), stamped);
+                }
+            }
+            if let Some(znc) = state
+                .znc
+                .as_ref()
+                .filter(|z| z.owns_channel(&channel_key))
+            {
+                for line in &parsed {
+                    if let LineKind::Join { nick, .. } = &line.kind {
+                        znc.trigger(Trigger::Join(nick.clone()));
+                    }
                 }
             }
 
@@ -193,6 +227,31 @@ impl Offsets {
             .insert(path.to_owned(), pos + complete as u64);
         Ok(String::from_utf8_lossy(&buf[..complete]).into_owned())
     }
+}
+
+/// The segments of the directory of `path` under the first logs dir holding it.
+fn dir_segments(path: &Path, state: &AppState) -> Option<Vec<String>> {
+    let abs = std::fs::canonicalize(path).ok()?;
+    let parent = abs.parent()?;
+    state
+        .logs_dirs
+        .iter()
+        .find_map(|logs_dir| {
+            parent
+                .strip_prefix(logs_dir)
+                .ok()
+        })
+        .map(|rel| {
+            let segments = rel
+                .components()
+                .map(|c| {
+                    c.as_os_str()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            segments
+        })
 }
 
 fn resolve_channel(path: &PathBuf, state: &AppState) -> Option<(String, LogFormat)> {
@@ -440,5 +499,59 @@ mod tests {
         presence
             .shutdown()
             .await;
+    }
+
+    #[tokio::test]
+    async fn connects_and_joins_of_the_network_reach_the_znc_runner() {
+        let root = tempdir();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let (mut channels, log) = znc_channel(&root_path, "");
+        let status = root_path.join("OFTC/status");
+        std::fs::create_dir_all(&status).unwrap();
+        let status_log = status.join("2026-01-01.log");
+        std::fs::write(&status_log, "[00:00:00] Connected to IRC (old)\n").unwrap();
+        let oftc = root_path.join("OFTC/#o");
+        std::fs::create_dir_all(&oftc).unwrap();
+        let oftc_log = oftc.join("2026-01-01.log");
+        std::fs::write(&oftc_log, "").unwrap();
+        add_channel(
+            &mut channels,
+            &["OFTC", "#o"],
+            vec![ChannelDir {
+                path: oftc,
+                format: LogFormat::Znc,
+            }],
+        );
+        let mut state = app_state(channels, "logs_dirs: []");
+        state.logs_dirs = vec![root_path];
+        let (znc, mut triggers) = crate::znc::Znc::for_test();
+        state.znc = Some(znc);
+        let watcher = start_watcher(Arc::new(state));
+
+        // A join in another network's channel is not the runner's business.
+        append(&log, b"[00:00:01] *** Joins: x (~x@h)\n");
+        append(
+            &status_log,
+            b"[00:00:02] Disconnected from IRC (a)\n[00:00:03] Connected to IRC (b)\n",
+        );
+        append(&oftc_log, b"[00:00:04] *** Joins: TiCPU (~t@h)\n");
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            let trigger = tokio::time::timeout(Duration::from_secs(5), triggers.recv())
+                .await
+                .expect("triggers within 5 s")
+                .unwrap();
+            got.push(format!("{trigger:?}"));
+        }
+        got.sort();
+        assert_eq!(got, ["Connected", "Join(\"TiCPU\")"]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            triggers
+                .try_recv()
+                .is_err(),
+            "more triggers than expected"
+        );
+        drop(watcher);
     }
 }

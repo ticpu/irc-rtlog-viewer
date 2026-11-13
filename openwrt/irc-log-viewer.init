@@ -34,6 +34,10 @@ start_service() {
 	index_path=$(awk '/^ *index_path:/{print $2}' "$CONF")
 	[ -n "$index_path" ] && procd_add_jail_mount_rw "$(dirname "$index_path")"
 
+	# The ZNC client certificate and key, read at startup.
+	client_cert=$(awk '/^ *client_cert:/{print $2}' "$CONF")
+	[ -n "$client_cert" ] && procd_add_jail_mount "$client_cert"
+
 	procd_close_instance
 }
 

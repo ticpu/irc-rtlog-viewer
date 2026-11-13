@@ -51,6 +51,7 @@ pub fn app_state(channels: ChannelNode, yaml: &str) -> AppState {
         ai_semaphore: None,
         reqwest_client: None,
         presence: None,
+        znc: None,
     }
 }
 

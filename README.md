@@ -48,6 +48,12 @@ search:
 log_timezone: EST5EDT,M3.2.0,M11.1.0
 presence:
   index_path: /var/lib/irc-logs/presence.yaml
+znc:
+  address: "[::1]:7778"
+  user: Tiky
+  network: OFTC
+  fingerprint: 3f:a1:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00
+  client_cert: /etc/irc-log-viewer/znc-client.pem
 ai:
   api_key: sk-ant-api03-...
   model: claude-haiku-5-5
@@ -76,13 +82,28 @@ ai:
 
 ### Presence
 
-The `presence` section is optional. When set, the viewer scans the archive in the background for each nick's last online (join, message, action, nick change to it), last offline (quit, part, kick, nick change from it) and last spoke (message, action), and for each channel's latest topic change. `GET <channel>/presence` returns them as JSON: `scanning` (true until the startup scan is done), `topic` (`nick`, `text`, `at`) or null, and `users`, mapping each nick to its `online`, `offline` and `spoke`, null when never seen. Stamps are RFC 3339 UTC. Without the section the route answers 404.
+The `presence` section is optional. When set, the viewer scans the archive in the background for each nick's last online (join, message, action, nick change to it), last offline (quit, part, kick, nick change from it) and last spoke (message, action), and for each channel's latest topic change. `GET <channel>/presence` returns them as JSON: `scanning` (true until the startup scan is done); `snapshot_at` and `stale` describing the live snapshot (null and false without one, see ZNC below); `topic` (`source` `live` or `archive`, `nick`, `text`, `at`) or null; and `users`, mapping each nick to `live` (in the channel now, or null without a snapshot), `prefixes` (such as `@+`), `online`, `offline` and `spoke`, null when never seen. Stamps are RFC 3339 UTC. Without the section the route answers 404.
 
 The index file is a disposable cache: at startup only new or changed log files are read, and deleting the index makes the next start rescan everything. Stamps only move forward, so a deleted or rewritten log keeps its contributions until the index is deleted. The index's directory must be writable by the viewer.
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `presence.index_path` | *(required)* | YAML file caching the stamps between runs, written after the scan, every 10 minutes when something changed, and at shutdown |
+
+### ZNC
+
+The `znc` section is optional and needs `presence`. ZNC never logs NAMES, so the archive cannot tell who is in a channel now; with this section the viewer opens a short client session to ZNC to read each channel's member list and topic, then keeps them current from the log lines it tails.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `znc.address` | *(required)* | `host:port` of a ZNC listener with SSL and IRC enabled, such as `"[::1]:7778"`; quote it in YAML |
+| `znc.user` | *(required)* | ZNC user |
+| `znc.network` | *(required)* | ZNC network of that user |
+| `znc.channel_path` | `network` | Path of the network's channel directories under `logs_dirs`, such as `OFTC` for `OFTC/#chan`; a channel ZNC joins with no directory there is ignored |
+| `znc.fingerprint` | *(required)* | SHA-256 of the listener's certificate, colon-separated hex; the output of `openssl x509 -noout -fingerprint -sha256` works as is |
+| `znc.client_cert` | | PEM file with the client certificate and its key, enrolled with ZNC's certauth module |
+| `znc.password` | | The ZNC user's password, instead of `client_cert`; set exactly one of the two |
+| `znc.timeout_secs` | `30` | Time one session may take from connect to the end of the burst |
 
 ### Search options
 
@@ -122,6 +143,44 @@ The `ai` section is optional. When omitted, the "ask" feature is disabled and no
 The built-in system prompt instructs the model to search logs using the provided tools, compile relevant excerpts, format output as markdown, and always produce a result document via the `done` tool.
 
 The daily budgets are rolling: a full allowance of N refills one request every 24h/N. A browser can drop its cookie for a fresh client budget, so the address budget is the binding one. A session that runs out mid-way stops with an error on the page.
+
+## ZNC integration
+
+### What the session does and when
+
+At startup, and each time the bouncer reconnects to IRC, the viewer logs in to ZNC as a client of the configured user and network, reads the burst ZNC sends for every attached channel (JOIN, topic, names with all prefixes), and disconnects. A reconnect is noticed from the `Connected to IRC` line in the network's `status/` log, which is read but never served; the session then waits until the bouncer's own joins have been quiet for 10 seconds. A failed session is logged and not retried until the next reconnect or restart.
+
+The certificate pin is the SHA-256 of the listener's certificate: expiry and host name are not checked, since ZNC's default certificate is self-signed with no subject alternative name. If the certificate changes, update `znc.fingerprint`. Check it with:
+
+```sh
+openssl s_client -connect '[::1]:7778' </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+```
+
+### Setting up certauth
+
+Generate the client certificate (here with openssl; any self-signed certificate works) and enrol its SHA-256 with certauth from an IRC client logged in as a ZNC admin:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 36500 -subj /CN=irc-log-viewer -keyout znc-client.pem -out znc-client.pem
+openssl x509 -in znc-client.pem -noout -fingerprint -sha256
+```
+
+```
+/msg *status LoadMod --type=global certauth
+/msg *status AddPort +7778 ipv6 irc ::1
+/msg *certauth Add <the client certificate's SHA-256>
+/msg *status SaveConfig
+```
+
+Then restart ZNC: certauth asks for client certificates only on listeners present when ZNC starts. docs/znc.md has the details, including the directory permissions SaveConfig needs on OpenWrt. With `znc.password` instead, no certauth is needed.
+
+### Side effects
+
+Each session is a ZNC client of the user. With AutoClearChanBuffer on, ZNC replays each channel's buffer to the session and then clears it, so lines buffered while no other client was attached are consumed. Channels detached in ZNC get no burst.
+
+### What pages show when ZNC is unreachable
+
+A `znc` section that cannot be used at startup (no `presence` section, an unreadable `client_cert`, a malformed `fingerprint`, both or neither of `client_cert` and `password`) is logged with its cause and live status stays off; the rest of the viewer runs. Hover stamps and the archive topic keep working. The live snapshot from the last successful session is kept and marked stale (`stale: true` in the JSON); with no session ever succeeding, `live` is null for every nick and no status is shown.
 
 ## Reverse proxy
 

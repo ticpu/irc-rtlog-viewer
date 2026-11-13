@@ -29,6 +29,7 @@ mod tail;
 mod templates;
 #[cfg(test)]
 mod test_support;
+mod znc;
 
 use parser::LogFormat;
 
@@ -75,6 +76,9 @@ pub struct Config {
     /// Archive stamps per nick; the presence endpoint 404s when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence: Option<PresenceConfig>,
+    /// Live membership from a ZNC session; needs `presence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub znc: Option<znc::ZncConfig>,
 }
 
 /// Settings for the per-nick archive stamps.
@@ -146,6 +150,7 @@ impl Default for Config {
             ai: None,
             log_timezone: default_log_timezone(),
             presence: None,
+            znc: None,
         }
     }
 }
@@ -274,6 +279,8 @@ pub struct AppState {
     pub limits: limits::Limits,
     /// Archive stamps; `None` when the presence section is absent.
     pub presence: Option<Arc<presence::Presence>>,
+    /// The ZNC session runner the tail triggers; `None` without a znc section.
+    pub znc: Option<znc::Znc>,
     /// Messages endpoint, pointed at a local stand-in by tests.
     #[cfg(test)]
     pub api_url: String,
@@ -368,6 +375,14 @@ fn default_config_yaml() -> Result<String, SerializeError> {
         "#log_timezone: UTC\n",
         "#presence:\n",
         "#  index_path: /var/lib/irc-logs/presence.yaml\n",
+        "#znc:\n",
+        "#  address: \"[::1]:7778\"\n",
+        "#  user: user\n",
+        "#  network: OFTC\n",
+        "#  channel_path: OFTC\n",
+        "#  fingerprint: <SHA-256 of the listener certificate>\n",
+        "#  client_cert: /etc/irc-log-viewer/znc-client.pem\n",
+        "#  timeout_secs: 30\n",
     ));
     Ok(yaml)
 }
@@ -443,6 +458,28 @@ async fn run() {
             )
         });
 
+    // A broken znc section costs live status only, never the log pages.
+    let znc = config
+        .znc
+        .as_ref()
+        .and_then(|z| {
+            let Some(presence) = &presence else {
+                eprintln!("znc: the znc section needs the presence section; live status is off");
+                return None;
+            };
+            match znc::Setup::new(z) {
+                Ok(setup) => Some(znc::start(
+                    setup,
+                    presence::channel_keys(&root),
+                    Arc::clone(presence),
+                )),
+                Err(e) => {
+                    eprintln!("znc: {}; live status is off", znc::error_chain(&e));
+                    None
+                }
+            }
+        });
+
     let bind = config
         .bind
         .clone();
@@ -476,6 +513,7 @@ async fn run() {
         reqwest_client,
         limits,
         presence,
+        znc,
         #[cfg(test)]
         api_url: crate::ai::ANTHROPIC_MESSAGES_URL.to_owned(),
     });
@@ -814,6 +852,12 @@ search:
 log_timezone: EST5EDT,M3.2.0,M11.1.0
 presence:
   index_path: /var/lib/irc-logs/presence.yaml
+znc:
+  address: "[::1]:7778"
+  user: Tiky
+  network: OFTC
+  fingerprint: 3f:a1:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00
+  client_cert: /etc/irc-log-viewer/znc-client.pem
 ai:
   api_key: placeholder
   model: claude-haiku-5-5
@@ -850,6 +894,12 @@ ai:
             365
         );
         assert!(resolve_log_timezone(&config.log_timezone).is_ok());
+        let znc = config
+            .znc
+            .as_ref()
+            .unwrap();
+        assert_eq!(znc.channel_path(), ["OFTC"]);
+        assert_eq!(znc.timeout_secs, 30);
         assert_eq!(
             config
                 .presence
