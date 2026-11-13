@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::parser::{LineKind, LogFormat, LogLine, parse_line};
-use crate::presence::{LiveClock, Presence};
-use crate::templates::render_line;
+use crate::presence::LogClock;
+use crate::templates::{LineTime, render_line};
 use crate::znc::{Trigger, is_connected_line};
 use crate::{AppState, ChannelNode};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
@@ -39,18 +39,15 @@ pub fn start_watcher(state: Arc<AppState>) -> notify::RecommendedWatcher {
     // Taken after the watch starts, so a line appended in between is either
     // already counted here or reported by a queued event.
     let mut offsets = Offsets::at_current_ends(&state.channels);
-    let live = state
-        .presence
-        .as_ref()
-        .map(|p| (Arc::clone(p), p.live_clock()));
-    tokio::task::spawn_blocking(move || tail_loop(rx, &mut offsets, live, &state));
+    let mut clock = state.log_clock();
+    tokio::task::spawn_blocking(move || tail_loop(rx, &mut offsets, &mut clock, &state));
     watcher
 }
 
 fn tail_loop(
     rx: std::sync::mpsc::Receiver<notify::Result<Event>>,
     offsets: &mut Offsets,
-    mut live: Option<(Arc<Presence>, LiveClock)>,
+    clock: &mut LogClock,
     state: &AppState,
 ) {
     for event in rx {
@@ -105,10 +102,24 @@ fn tail_loop(
                 continue;
             }
 
-            if let Some((presence, clock)) = live.as_mut() {
-                if let Some(stamped) = clock.stamp(path, format, &parsed) {
-                    presence.feed(channel_key.clone(), stamped);
-                }
+            let stamps = clock
+                .stamp(path, format, &parsed)
+                .unwrap_or_else(|| vec![None; parsed.len()]);
+            if let Some(presence) = &state.presence {
+                let stamped = parsed
+                    .iter()
+                    .zip(&stamps)
+                    .filter_map(|(line, at)| {
+                        at.map(|at| {
+                            (
+                                at,
+                                line.kind
+                                    .clone(),
+                            )
+                        })
+                    })
+                    .collect();
+                presence.feed(channel_key.clone(), stamped);
             }
             if let Some(znc) = state
                 .znc
@@ -128,9 +139,14 @@ fn tail_loop(
             let Some(sender) = senders.get(&channel_key) else {
                 continue;
             };
-            for line in &parsed {
+            let zone = clock.zone_name(format);
+            for (line, at) in parsed
+                .iter()
+                .zip(stamps)
+            {
+                let time = at.map(|at| LineTime { at, zone });
                 // An error only means no viewer is subscribed right now.
-                let _ = sender.send(render_line(line).into_string());
+                let _ = sender.send(render_line(line, time).into_string());
             }
         }
     }
@@ -398,6 +414,10 @@ mod tests {
             .expect("no line streamed within 5 s")
             .unwrap();
         assert!(first.contains("after start"), "{first}");
+        assert!(
+            first.contains(r#"data-at="2026-01-01T00:00:01Z" title="file time 00:00:01 UTC""#),
+            "{first}"
+        );
         assert!(
             rx.try_recv()
                 .is_err(),

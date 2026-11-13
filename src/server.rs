@@ -398,9 +398,25 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
         }
     };
 
-    let lines: Vec<_> = content
+    let parsed: Vec<_> = content
         .lines()
         .filter_map(|l| parse_line(l, format))
+        .collect();
+    let mut clock = state.log_clock();
+    let stamps = clock
+        .stamp(&path, format, &parsed)
+        .unwrap_or_default();
+    let mut stamps = stamps.into_iter();
+    let lines: Vec<_> = parsed
+        .into_iter()
+        .map(|line| {
+            (
+                line,
+                stamps
+                    .next()
+                    .flatten(),
+            )
+        })
         .collect();
 
     let dates = channel_dates(channel);
@@ -423,6 +439,7 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
         channel,
         date,
         lines: &lines,
+        zone: clock.zone_name(format),
         prev_date: prev,
         next_date: next,
         is_today,
@@ -471,6 +488,7 @@ fn serve_search(state: &AppState, channel: &crate::Channel, query: &str) -> Resp
             .config
             .search
             .max_days,
+        &mut state.log_clock(),
     );
     let mut resp = templates::search_page(
         &state
@@ -1328,6 +1346,93 @@ mod tests {
     async fn unknown_channel_is_not_found() {
         let (status, _) = get_status("/OFTC/%23nope/").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    async fn body_of(app: &axum::Router, uri: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn line_times_carry_their_utc_instant_and_keep_file_time_anchors() {
+        let root = tempdir();
+        let znc = root
+            .path()
+            .join("znc");
+        let iso = root
+            .path()
+            .join("iso");
+        std::fs::create_dir_all(&znc).unwrap();
+        std::fs::create_dir_all(&iso).unwrap();
+        // 01:xx repeats on 2026-11-01 in EST5EDT; 01:10 after 01:50 is the second pass.
+        std::fs::write(
+            znc.join("2026-11-01.log"),
+            "[01:50:00] <a> first hello\n[01:10:00] <a> second hello\n",
+        )
+        .unwrap();
+        std::fs::write(
+            iso.join("2026-11-01.log"),
+            "2026-11-01T23:59:59Z <b> iso hello\n",
+        )
+        .unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = |path, format| vec![ChannelDir { path, format }];
+        add_channel(
+            &mut channels,
+            &["#z"],
+            dirs(znc, crate::parser::LogFormat::Znc),
+        );
+        add_channel(
+            &mut channels,
+            &["#i"],
+            dirs(iso, crate::parser::LogFormat::Iso8601),
+        );
+        let posix = "EST5EDT,M3.2.0,M11.1.0";
+        let mut state = app_state(
+            channels,
+            &format!("{{logs_dirs: [], log_timezone: '{posix}'}}"),
+        );
+        state.log_tz = crate::resolve_log_timezone(posix).unwrap();
+        let app = app(Arc::new(state), PEER);
+
+        let page = body_of(&app, "/%23z/2026-11-01").await;
+        for (hms, anchor, at) in [
+            ("01:50:00", "T015000", "2026-11-01T05:50:00Z"),
+            ("01:10:00", "T011000", "2026-11-01T06:10:00Z"),
+        ] {
+            let link = format!(
+                r##"<a class="ts" href="#{anchor}" data-at="{at}" title="file time {hms} {posix}">{hms}</a>"##
+            );
+            assert!(page.contains(&link), "{link} missing: {page}");
+            assert!(page.contains(&format!(r#"id="{anchor}""#)), "{page}");
+        }
+        assert!(page.contains(r#"data-date="2026-11-01""#), "{page}");
+
+        let page = body_of(&app, "/%23i/2026-11-01").await;
+        let link = r##"<a class="ts" href="#T235959" data-at="2026-11-01T23:59:59Z" title="file time 23:59:59 UTC">23:59:59</a>"##;
+        assert!(page.contains(link), "{page}");
+
+        let found = body_of(&app, "/%23z/search?q=second").await;
+        let link = format!(
+            r##"<a class="ts" href="/%23z/2026-11-01#T011000" data-at="2026-11-01T06:10:00Z" title="file time 01:10:00 {posix}">01:10:00</a>"##
+        );
+        assert!(found.contains(&link), "{link} missing: {found}");
+        assert!(
+            found.contains(r#"<div class="line" data-date="2026-11-01">"#),
+            "{found}"
+        );
     }
 }
 

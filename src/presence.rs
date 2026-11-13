@@ -45,8 +45,10 @@
 //! the end of the scan, and a shutdown request. Live lines merge into the
 //! stamps but leave the file's index entry alone: its stat no longer
 //! matches, so the next start reparses the file, which the max-merge makes
-//! harmless. The tail stamps its lines with a [`LiveClock`], which carries
-//! the fold rule's previous line across batches of the same day file.
+//! harmless. The tail stamps its lines with a [`LogClock`], which carries
+//! the fold rule's previous line across batches of the same day file. Log
+//! pages and search use the same clock for the UTC instant each line's time
+//! link carries, so a page and the stamps never disagree.
 //!
 //! # Live snapshots and the session race
 //!
@@ -337,24 +339,45 @@ impl DayClock {
     }
 }
 
-/// Stamps lines the tail reads, keeping one [`DayClock`] per directory for
-/// its current day file, so the fold rule sees the previous live line.
-pub struct LiveClock {
+/// Converts the times of log lines to UTC for every reader of a day file:
+/// the tail, log pages and search. It keeps one [`DayClock`] per directory
+/// for the day file last read, so the fold rule sees the previous line
+/// across batches of the same file.
+pub struct LogClock {
     log_tz: TimeZone,
+    log_tz_name: String,
     /// Per directory: the day file last read and its clock, `None` when its
     /// name is not a date.
     by_dir: HashMap<PathBuf, (PathBuf, Option<DayClock>)>,
 }
 
-impl LiveClock {
-    /// `lines`, read in order from the day file `path`, with their UTC
-    /// stamps. `None` when the file's name is not a `YYYY-MM-DD` date.
+impl LogClock {
+    /// A clock reading ZNC directories in `log_tz`, configured as `log_tz_name`.
+    pub fn new(log_tz: TimeZone, log_tz_name: &str) -> Self {
+        Self {
+            log_tz,
+            log_tz_name: log_tz_name.to_owned(),
+            by_dir: HashMap::new(),
+        }
+    }
+
+    /// The zone lines of `format` are written in, as configured.
+    pub fn zone_name(&self, format: LogFormat) -> &str {
+        match format {
+            LogFormat::Znc => &self.log_tz_name,
+            LogFormat::Iso8601 => "UTC",
+        }
+    }
+
+    /// The UTC stamp of each of `lines`, read in order from the day file
+    /// `path`; `None` for the whole file when its name is not a date, and for
+    /// a line whose time does not exist.
     pub fn stamp<'l>(
         &mut self,
         path: &Path,
         format: LogFormat,
         lines: impl IntoIterator<Item = &'l LogLine>,
-    ) -> Option<Vec<(Timestamp, LineKind)>> {
+    ) -> Option<Vec<Option<Timestamp>>> {
         let dir = path.parent()?;
         let tz = match format {
             LogFormat::Znc => self
@@ -372,46 +395,47 @@ impl LiveClock {
         let clock = slot
             .1
             .as_mut()?;
-        let mut stamped = Vec::new();
-        let mut skipped = 0usize;
-        for line in lines {
-            match clock.stamp(line.time) {
-                Some(at) => stamped.push((
-                    at,
-                    line.kind
-                        .clone(),
-                )),
-                None => skipped += 1,
-            }
-        }
+        let stamps: Vec<Option<Timestamp>> = lines
+            .into_iter()
+            .map(|line| clock.stamp(line.time))
+            .collect();
+        let skipped = stamps
+            .iter()
+            .filter(|s| s.is_none())
+            .count();
         if skipped > 0 {
             eprintln!(
-                "presence: skipped {skipped} unparsable live lines in {}",
+                "presence: {skipped} lines of {} have a time that does not exist",
                 path.display()
             );
         }
-        Some(stamped)
+        Some(stamps)
     }
 }
 
-/// A clock for the day file `path`, or `None`, logged, when its name is not a date.
+/// A clock for the day file `path` (`YYYY-MM-DD.log` or `.log.zst`), or
+/// `None`, logged, when its name is not a date.
 fn day_clock(path: &Path, tz: TimeZone) -> Option<DayClock> {
-    let stem = path
-        .file_stem()
+    let name = path
+        .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
+    let stem = name
+        .strip_suffix(".log")
+        .or_else(|| name.strip_suffix(".log.zst"))
+        .unwrap_or(name);
     match stem.parse::<Date>() {
         Ok(date) if stem.len() == 10 => Some(DayClock::new(tz, date)),
         Ok(_) => {
             eprintln!(
-                "presence: not stamping live lines of {}: not a YYYY-MM-DD name",
+                "presence: not converting times of {}: not a YYYY-MM-DD name",
                 path.display()
             );
             None
         }
         Err(e) => {
             eprintln!(
-                "presence: not stamping live lines of {}: not a date: {e}",
+                "presence: not converting times of {}: not a date: {e}",
                 path.display()
             );
             None
@@ -995,20 +1019,9 @@ pub struct Presence {
     live: ArcSwap<HashMap<String, Arc<LiveChannel>>>,
     scanning: AtomicBool,
     inbox: mpsc::Sender<Input>,
-    log_tz: TimeZone,
 }
 
 impl Presence {
-    /// A stamper for lines the tail reads, ZNC directories read in `log_timezone`.
-    pub fn live_clock(&self) -> LiveClock {
-        LiveClock {
-            log_tz: self
-                .log_tz
-                .clone(),
-            by_dir: HashMap::new(),
-        }
-    }
-
     /// Applies `lines`, read live from the channel keyed `channel`, to its
     /// stamps and live snapshot. Blocks while the actor's inbox is full;
     /// call it from a blocking thread.
@@ -1086,7 +1099,6 @@ pub fn start(index_path: PathBuf, log_tz: TimeZone, root: &ChannelNode) -> Arc<P
         live: ArcSwap::from_pointee(HashMap::new()),
         scanning: AtomicBool::new(true),
         inbox,
-        log_tz: log_tz.clone(),
     });
     let channels = scan_channels(root);
     tokio::spawn(run_actor(
@@ -1918,22 +1930,16 @@ mod tests {
     }
 
     #[test]
-    fn live_clock_keeps_the_fold_across_batches_and_follows_the_day_file() {
-        let tz = resolve_log_timezone("EST5EDT,M3.2.0,M11.1.0").unwrap();
-        let (inbox, _rx) = mpsc::channel(1);
-        let presence = Presence {
-            channels: ArcSwap::from_pointee(HashMap::new()),
-            live: ArcSwap::from_pointee(HashMap::new()),
-            scanning: AtomicBool::new(false),
-            inbox,
-            log_tz: tz,
-        };
-        let mut clock = presence.live_clock();
+    fn log_clock_keeps_the_fold_across_batches_and_follows_the_day_file() {
+        let posix = "EST5EDT,M3.2.0,M11.1.0";
+        let mut clock = LogClock::new(resolve_log_timezone(posix).unwrap(), posix);
+        assert_eq!(clock.zone_name(LogFormat::Znc), posix);
+        assert_eq!(clock.zone_name(LogFormat::Iso8601), "UTC");
         let line = |h, m| LogLine {
             time: hms(h, m, 0),
             kind: says("a"),
         };
-        let at = |stamped: Option<Vec<(Timestamp, LineKind)>>| stamped.unwrap()[0].0;
+        let at = |stamped: Option<Vec<Option<Timestamp>>>| stamped.unwrap()[0].unwrap();
         let fold_day = Path::new("/l/#c/2026-11-01.log");
         let first = clock.stamp(fold_day, LogFormat::Znc, &[line(1, 50)]);
         assert_eq!(at(first), ts("2026-11-01T05:50:00Z"));
@@ -1947,6 +1953,9 @@ mod tests {
         let iso = Path::new("/l/#i/2026-11-02.log");
         let fourth = clock.stamp(iso, LogFormat::Iso8601, &[line(0, 5)]);
         assert_eq!(at(fourth), ts("2026-11-02T00:05:00Z"));
+        let compressed = Path::new("/l/#z/2026-11-02.log.zst");
+        let fifth = clock.stamp(compressed, LogFormat::Znc, &[line(0, 5), line(24, 0)]);
+        assert_eq!(fifth, Some(vec![Some(ts("2026-11-02T05:05:00Z")), None]));
 
         assert_eq!(
             clock.stamp(Path::new("/l/#c/today.log"), LogFormat::Znc, &[line(0, 0)]),
@@ -2245,10 +2254,11 @@ mod tests {
             let (status, _, body) = get(&app, "/%23c/2026-01-01", None).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert!(body.contains(r#"data-nick="Foo[x]""#), "{body}");
+            // Log times use the zone selector with or without presence.
+            assert!(body.contains(r#"<select id="tz-select""#), "{body}");
             for wired in [
                 r#"data-presence="/%23c/presence""#,
                 r#"<p id="topic" hidden"#,
-                r#"<select id="tz-select""#,
             ] {
                 assert_eq!(
                     body.contains(wired),

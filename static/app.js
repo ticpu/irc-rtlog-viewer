@@ -138,6 +138,85 @@
         });
     }
 
+    // Times are shown in the viewer's zone: the browser's, or the one picked
+    // in tz-select and kept in localStorage. Line anchors stay in file time.
+    var stampFormat = null;
+    var partsFormat = null;
+    var onZoneChange = [];
+    var useZone = function(zone) {
+        var options = zone ? {timeZone: zone} : {};
+        try {
+            stampFormat = new Intl.DateTimeFormat(undefined,
+                Object.assign({dateStyle: 'medium', timeStyle: 'medium'}, options));
+            partsFormat = new Intl.DateTimeFormat('en-CA', Object.assign({
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+            }, options));
+            return true;
+        } catch (e) {
+            useZone(null);
+            return false;
+        }
+    };
+    var when = function(stamp) {
+        return stampFormat.format(new Date(stamp));
+    };
+    // A line's time as hh:mm:ss in the viewer's zone, with MM-DD in front when
+    // that falls on another day than the file the line is from.
+    var showLineTimes = function(root) {
+        var links = root.querySelectorAll('a.ts[data-at]');
+        for (var i = 0; i < links.length; i++) {
+            var parts = {};
+            partsFormat.formatToParts(new Date(links[i].getAttribute('data-at'))).forEach(function(p) {
+                parts[p.type] = p.value;
+            });
+            var dayOf = links[i].closest('[data-date]');
+            var fileDate = dayOf ? dayOf.getAttribute('data-date') : null;
+            var date = parts.year + '-' + parts.month + '-' + parts.day;
+            links[i].textContent = (fileDate && date !== fileDate ? parts.month + '-' + parts.day + ' ' : '') +
+                parts.hour + ':' + parts.minute + ':' + parts.second;
+        }
+    };
+
+    var zone = localStorage.getItem('tz');
+    if (!useZone(zone)) {
+        console.warn('dropping unknown time zone ' + zone);
+        localStorage.removeItem('tz');
+        zone = null;
+    }
+    var tzSelect = document.getElementById('tz-select');
+    if (tzSelect) {
+        var browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        tzSelect.options[0].textContent = 'browser time zone (' + browserZone + ')';
+        var zones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
+        if (zones.indexOf('UTC') === -1) zones = ['UTC'].concat(zones);
+        if (zone && zones.indexOf(zone) === -1) zones = [zone].concat(zones);
+        for (var z = 0; z < zones.length; z++) {
+            var option = document.createElement('option');
+            option.value = zones[z];
+            option.textContent = zones[z];
+            tzSelect.appendChild(option);
+        }
+        tzSelect.value = zone || '';
+        tzSelect.addEventListener('change', function() {
+            if (tzSelect.value) {
+                localStorage.setItem('tz', tzSelect.value);
+            } else {
+                localStorage.removeItem('tz');
+            }
+            useZone(tzSelect.value || null);
+            onZoneChange.forEach(function(render) {
+                render();
+            });
+        });
+    }
+    if (log) {
+        showLineTimes(log);
+        onZoneChange.push(function() {
+            showLineTimes(log);
+        });
+    }
+
     // The JSON keys users by display nick; lookups go through the network's
     // rfc1459 casemapping, as the server's index does.
     var RFC1459_UPPER = {'[': '{', ']': '}', '\\': '|', '~': '^'};
@@ -152,28 +231,12 @@
     if (log && log.dataset.presence) {
         var presenceUrl = log.dataset.presence;
         var topicBox = document.getElementById('topic');
-        var tzSelect = document.getElementById('tz-select');
         var users = {};
         var topic = null;
         var scanning = true;
         var snapshotAt = null;
         var stale = false;
-        var stampFormat = null;
 
-        var useZone = function(zone) {
-            var options = {dateStyle: 'medium', timeStyle: 'medium'};
-            if (zone) options.timeZone = zone;
-            try {
-                stampFormat = new Intl.DateTimeFormat(undefined, options);
-                return true;
-            } catch (e) {
-                stampFormat = new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'medium'});
-                return false;
-            }
-        };
-        var when = function(stamp) {
-            return stampFormat.format(new Date(stamp));
-        };
         // In the channel now: true or false with a ZNC snapshot, null without one.
         var liveOf = function(user) {
             if (snapshotAt === null) return null;
@@ -235,36 +298,7 @@
             decorate(log);
             showTopic();
         };
-
-        var zone = localStorage.getItem('tz');
-        if (!useZone(zone)) {
-            console.warn('presence: dropping unknown time zone ' + zone);
-            localStorage.removeItem('tz');
-            zone = null;
-        }
-        if (tzSelect) {
-            var browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-            tzSelect.options[0].textContent = 'browser time zone (' + browserZone + ')';
-            var zones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
-            if (zones.indexOf('UTC') === -1) zones = ['UTC'].concat(zones);
-            if (zone && zones.indexOf(zone) === -1) zones = [zone].concat(zones);
-            for (var z = 0; z < zones.length; z++) {
-                var option = document.createElement('option');
-                option.value = zones[z];
-                option.textContent = zones[z];
-                tzSelect.appendChild(option);
-            }
-            tzSelect.value = zone || '';
-            tzSelect.addEventListener('change', function() {
-                if (tzSelect.value) {
-                    localStorage.setItem('tz', tzSelect.value);
-                } else {
-                    localStorage.removeItem('tz');
-                }
-                useZone(tzSelect.value || null);
-                render();
-            });
-        }
+        onZoneChange.push(render);
 
         var timer = null;
         var load;
@@ -313,6 +347,7 @@
             log.insertAdjacentHTML('beforeend', e.data);
             var added = log.lastElementChild;
             if (added && added.classList.contains('line')) {
+                showLineTimes(added);
                 if (embeds && embeds.checked) embedLine(added);
                 if (onNewLine) onNewLine(added);
             }

@@ -272,6 +272,8 @@ pub struct AppState {
     pub config: Config,
     /// Canonicalized log roots.
     pub logs_dirs: Vec<PathBuf>,
+    /// Zone of ZNC-format log times, resolved from `log_timezone`.
+    pub log_tz: TimeZone,
     /// Channel tree discovered at startup.
     pub channels: ChannelNode,
     /// Live-tail broadcasters, keyed by channel path.
@@ -289,6 +291,19 @@ pub struct AppState {
     /// Messages endpoint, pointed at a local stand-in by tests.
     #[cfg(test)]
     pub api_url: String,
+}
+
+impl AppState {
+    /// A fresh converter of log times to UTC, in the configured zone.
+    pub fn log_clock(&self) -> presence::LogClock {
+        presence::LogClock::new(
+            self.log_tz
+                .clone(),
+            &self
+                .config
+                .log_timezone,
+        )
+    }
 }
 
 fn main() {
@@ -333,7 +348,7 @@ pub fn yaml_options() -> serde_saphyr::Options {
 
 /// Resolves `log_timezone`: UTC, an IANA name from the system tzdb, else a
 /// POSIX TZ string such as `EST5EDT,M3.2.0,M11.1.0`, which needs no tzdb.
-fn resolve_log_timezone(name: &str) -> Result<TimeZone, String> {
+pub fn resolve_log_timezone(name: &str) -> Result<TimeZone, String> {
     resolve_log_timezone_in(name, jiff::tz::db())
 }
 
@@ -488,7 +503,7 @@ async fn run() {
             presence::start(
                 p.index_path
                     .clone(),
-                log_tz,
+                log_tz.clone(),
                 &root,
             )
         });
@@ -548,6 +563,7 @@ async fn run() {
         reqwest_client,
         limits,
         presence,
+        log_tz,
         znc,
         #[cfg(test)]
         api_url: crate::ai::ANTHROPIC_MESSAGES_URL.to_owned(),

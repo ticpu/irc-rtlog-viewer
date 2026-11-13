@@ -1,3 +1,4 @@
+use jiff::Timestamp;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::parser::{LineKind, LogLine};
@@ -69,13 +70,31 @@ pub fn linkify(text: &str) -> Markup {
     PreEscaped(result)
 }
 
-pub fn render_line(line: &LogLine) -> Markup {
+/// When a line was written: its UTC instant and the zone its file time is in.
+#[derive(Clone, Copy)]
+pub struct LineTime<'a> {
+    pub at: Timestamp,
+    pub zone: &'a str,
+}
+
+/// A line's time link: file time as text and in the anchor, which shared
+/// links depend on; the UTC instant in `data-at` for app.js to show in the
+/// viewer's zone.
+fn time_link(href: &str, line: &LogLine, time: Option<LineTime>) -> Markup {
+    let hms = line
+        .time
+        .to_hms();
+    html! {
+        a.ts href=(href)
+            data-at=[time.map(|t| t.at.to_string())]
+            title=[time.map(|t| format!("file time {hms} {}", t.zone))] { (hms) }
+    }
+}
+
+pub fn render_line(line: &LogLine, time: Option<LineTime>) -> Markup {
     let anchor = line
         .time
         .to_anchor();
-    let ts = line
-        .time
-        .to_hms();
     let class = if line.is_event() {
         "line event"
     } else {
@@ -84,7 +103,7 @@ pub fn render_line(line: &LogLine) -> Markup {
 
     html! {
         div class=(class) id=(&anchor) {
-            a.ts href=(format!("#{anchor}")) { (ts) }
+            (time_link(&format!("#{anchor}"), line, time))
             " "
             @match &line.kind {
                 LineKind::Message { nick, text } => {
@@ -223,7 +242,10 @@ pub struct LogPageContext<'a> {
     pub tree: &'a ChannelNode,
     pub channel: &'a Channel,
     pub date: &'a str,
-    pub lines: &'a [LogLine],
+    /// The day's lines with their UTC stamps, `None` where unknown.
+    pub lines: &'a [(LogLine, Option<Timestamp>)],
+    /// Zone the day file's times are in.
+    pub zone: &'a str,
     pub prev_date: Option<&'a str>,
     pub next_date: Option<&'a str>,
     pub is_today: bool,
@@ -286,11 +308,9 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                         input id="toggle-embeds" type="checkbox";
                         " show embeds"
                     }
-                    @if ctx.presence {
-                        " "
-                        select id="tz-select" title="Time zone of the times shown when hovering a nick" {
-                            option value="" { "browser time zone" }
-                        }
+                    " "
+                    select id="tz-select" title="Time zone the log times and nick hovers are shown in; links keep the log file's time" {
+                        option value="" { "browser time zone" }
                     }
                     " "
                     form.search-form action=(format!("{bp}/{encoded}/search")) method="get" {
@@ -304,11 +324,11 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     }
                 }
             }
-            div id="log" class="hide-events"
+            div id="log" class="hide-events" data-date=(date)
                 data-latest=[is_today.then(|| format!("{bp}/{encoded}/latest"))]
                 data-presence=[ctx.presence.then(|| format!("{bp}/{encoded}/presence"))] {
-                @for line in lines {
-                    (render_line(line))
+                @for (line, at) in lines {
+                    (render_line(line, at.map(|at| LineTime { at, zone: ctx.zone })))
                 }
             }
         },
@@ -346,15 +366,16 @@ pub fn search_page(
                 @if results.lines.is_empty() {
                     p { "no results for \"" (query) "\"" }
                 }
-                @for (date, line) in &results.lines {
-                    div.line {
-                        a.date href=(format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor())) {
+                @for found in &results.lines {
+                    @let date = &found.date;
+                    @let line = &found.line;
+                    @let href = format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor());
+                    div.line data-date=(date) {
+                        a.date href=(&href) {
                             (date)
                         }
                         " "
-                        a.ts href=(format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor())) {
-                            (line.time.to_hms())
-                        }
+                        (time_link(&href, line, found.at.map(|at| LineTime { at, zone: &found.zone })))
                         " "
                         @match &line.kind {
                             LineKind::Message { nick, text } => {
@@ -506,7 +527,7 @@ mod tests {
                 topic: "see https://poc.bcachefs.org/paper.pdf <script>alert(1)</script>".into(),
             },
         };
-        let out = render_line(&line).into_string();
+        let out = render_line(&line, None).into_string();
         assert!(out.contains(r#"<a href="https://poc.bcachefs.org/paper.pdf""#));
         assert!(out.contains(" changed the topic to: "));
         assert!(out.contains(r#"class="line event""#));
