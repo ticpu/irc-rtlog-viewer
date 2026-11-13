@@ -126,6 +126,33 @@ pub fn render_line(line: &LogLine) -> Markup {
                         span.nick style=(nick_color_style(new_nick)) { (new_nick) }
                     }
                 },
+                LineKind::Kick { nick, by, reason } => {
+                    span.ev {
+                        "⨯ "
+                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        " was kicked by "
+                        span.nick style=(nick_color_style(by)) { (by) }
+                        @if !reason.is_empty() {
+                            " (" (reason) ")"
+                        }
+                    }
+                },
+                LineKind::Topic { nick, topic } => {
+                    span.ev {
+                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        " changed the topic to: "
+                        (linkify(topic))
+                    }
+                },
+                LineKind::Mode { nick, modes, args } => {
+                    span.ev {
+                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        " sets mode " (modes)
+                        @for arg in args {
+                            " " (arg)
+                        }
+                    }
+                },
                 LineKind::Notice { text } => {
                     span.ev { "*** " (text) }
                 },
@@ -403,6 +430,7 @@ pub fn ask_output_page(title: &str, md_filename: &str, content: &str, base_path:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::Time;
 
     #[test]
     fn test_linkify_plain() {
@@ -430,6 +458,27 @@ mod tests {
     #[test]
     fn test_linkify_escapes_html() {
         let out = linkify("<script>alert(1)</script>").into_string();
+        assert!(!out.contains("<script>"));
+        assert!(out.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_render_topic_links_and_escapes() {
+        let line = LogLine {
+            time: Time {
+                hour: 19,
+                minute: 30,
+                second: 47,
+            },
+            kind: LineKind::Topic {
+                nick: "py1hon".into(),
+                topic: "see https://poc.bcachefs.org/paper.pdf <script>alert(1)</script>".into(),
+            },
+        };
+        let out = render_line(&line).into_string();
+        assert!(out.contains(r#"<a href="https://poc.bcachefs.org/paper.pdf""#));
+        assert!(out.contains(" changed the topic to: "));
+        assert!(out.contains(r#"class="line event""#));
         assert!(!out.contains("<script>"));
         assert!(out.contains("&lt;script&gt;"));
     }

@@ -57,7 +57,24 @@ pub enum LineKind {
         old_nick: String,
         new_nick: String,
     },
-    /// Any other `***` server or channel notice, such as a mode change or topic.
+    /// `*** X was kicked by Y (reason)`.
+    Kick {
+        nick: String,
+        by: String,
+        reason: String,
+    },
+    /// `*** X changes topic to '<topic>'`.
+    Topic {
+        nick: String,
+        topic: String,
+    },
+    /// `*** X sets mode: <modes> <args>`, X being a nick, a server or `Server`.
+    Mode {
+        nick: String,
+        modes: String,
+        args: Vec<String>,
+    },
+    /// Any other `***` server or channel notice.
     Notice {
         text: String,
     },
@@ -208,6 +225,8 @@ fn parse_znc_event(time: Time, rest: &str) -> Option<LogLine> {
     } else if let Some(rest) = rest.strip_prefix("Parts: ") {
         // nick (~user@host) (reason)
         parse_quit_or_part(time, rest, false)
+    } else if let Some(kind) = parse_nick_event(rest) {
+        Some(LogLine { time, kind })
     } else if let Some(pos) = rest.find(" is now known as ") {
         let old_nick = rest[..pos].to_string();
         let new_nick = rest[pos + 17..].to_string();
@@ -215,6 +234,57 @@ fn parse_znc_event(time: Time, rest: &str) -> Option<LogLine> {
             time,
             kind: LineKind::NickChange { old_nick, new_nick },
         })
+    } else {
+        None
+    }
+}
+
+/// Kick, topic and mode lines, anchored on the leading nick, which has no space.
+fn parse_nick_event(rest: &str) -> Option<LineKind> {
+    let (nick, rest) = rest.split_once(' ')?;
+    if nick.is_empty() {
+        return None;
+    }
+    let nick = nick.to_string();
+    if let Some(rest) = rest.strip_prefix("was kicked by ") {
+        let (by, reason_part) = rest
+            .split_once(' ')
+            .unwrap_or((rest, ""));
+        if by.is_empty() {
+            return None;
+        }
+        let reason = if reason_part.is_empty() {
+            ""
+        } else {
+            let reason_part = reason_part.strip_prefix('(')?;
+            reason_part
+                .strip_suffix(')')
+                .unwrap_or(reason_part)
+        };
+        Some(LineKind::Kick {
+            nick,
+            by: by.to_string(),
+            reason: reason.to_string(),
+        })
+    } else if let Some(rest) = rest.strip_prefix("changes topic to ") {
+        let topic = rest
+            .strip_prefix('\'')?
+            .strip_suffix('\'')?;
+        Some(LineKind::Topic {
+            nick,
+            topic: topic.to_string(),
+        })
+    } else if let Some(rest) = rest.strip_prefix("sets mode: ") {
+        let mut words = rest
+            .split(' ')
+            .filter(|word| !word.is_empty());
+        let modes = words
+            .next()?
+            .to_string();
+        let args = words
+            .map(str::to_string)
+            .collect();
+        Some(LineKind::Mode { nick, modes, args })
     } else {
         None
     }
@@ -257,6 +327,23 @@ fn parse_quit_or_part(time: Time, rest: &str, is_quit: bool) -> Option<LogLine> 
 mod tests {
     use super::*;
 
+    fn znc_kind(line: &str) -> LineKind {
+        parse_line(line, LogFormat::Znc)
+            .unwrap()
+            .kind
+    }
+
+    fn mode(nick: &str, modes: &str, args: &[&str]) -> LineKind {
+        LineKind::Mode {
+            nick: nick.into(),
+            modes: modes.into(),
+            args: args
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect(),
+        }
+    }
+
     #[test]
     fn test_znc_unrecognised_notices_are_events() {
         for line in [
@@ -267,8 +354,124 @@ mod tests {
             let parsed = parse_line(line, LogFormat::Znc).unwrap();
             assert!(parsed.is_event(), "{line}");
         }
+        assert_eq!(
+            znc_kind("[01:02:03] *** Joins: malformed-without-host"),
+            LineKind::Notice {
+                text: "Joins: malformed-without-host".into(),
+            }
+        );
         let message = parse_line("[01:02:03] <a> *** not a notice", LogFormat::Znc).unwrap();
         assert!(!message.is_event());
+    }
+
+    #[test]
+    fn test_znc_mode() {
+        assert_eq!(
+            znc_kind("[15:32:11] *** Server sets mode: +nt "),
+            mode("Server", "+nt", &[])
+        );
+        assert_eq!(
+            znc_kind("[01:49:26] *** Server sets mode: +nst "),
+            mode("Server", "+nst", &[])
+        );
+        assert_eq!(
+            znc_kind("[12:37:25] *** larich.oftc.net sets mode: +o py1hon"),
+            mode("larich.oftc.net", "+o", &["py1hon"])
+        );
+        assert_eq!(
+            znc_kind("[10:00:00] *** ChanServ sets mode: +o-v alice bob"),
+            mode("ChanServ", "+o-v", &["alice", "bob"])
+        );
+    }
+
+    #[test]
+    fn test_znc_topic() {
+        assert_eq!(
+            znc_kind(
+                "[19:30:47] *** py1hon changes topic to 'https://evilpiepirate.org/forge/kent/consciousness | https://poc.bcachefs.org/paper.pdf'"
+            ),
+            LineKind::Topic {
+                nick: "py1hon".into(),
+                topic: "https://evilpiepirate.org/forge/kent/consciousness | https://poc.bcachefs.org/paper.pdf".into(),
+            }
+        );
+        assert_eq!(
+            znc_kind(
+                "[10:00:00] *** op changes topic to ''quoted' (x) a was kicked by b (c) is now known as d'"
+            ),
+            LineKind::Topic {
+                nick: "op".into(),
+                topic: "'quoted' (x) a was kicked by b (c) is now known as d".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_znc_kick() {
+        let kick = |by: &str, reason: &str| LineKind::Kick {
+            nick: "spammer".into(),
+            by: by.into(),
+            reason: reason.into(),
+        };
+        assert_eq!(
+            znc_kind("[10:00:00] *** spammer was kicked by ChanServ (Banned: spam)"),
+            kick("ChanServ", "Banned: spam")
+        );
+        assert_eq!(
+            znc_kind("[10:00:00] *** spammer was kicked by op ()"),
+            kick("op", "")
+        );
+        assert_eq!(
+            znc_kind("[10:00:00] *** spammer was kicked by op (flood (again))"),
+            kick("op", "flood (again)")
+        );
+        assert_eq!(
+            znc_kind("[10:00:00] *** spammer was kicked by op"),
+            kick("op", "")
+        );
+    }
+
+    #[test]
+    fn test_znc_nick_events_need_the_prefix_shape() {
+        assert_eq!(
+            znc_kind("[01:02:03] <a> *** x sets mode: +o y"),
+            LineKind::Message {
+                nick: "a".into(),
+                text: "*** x sets mode: +o y".into(),
+            }
+        );
+        assert_eq!(
+            znc_kind("[01:02:03] *** two words sets mode: +o y"),
+            LineKind::Notice {
+                text: "two words sets mode: +o y".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_znc_truncated_nick_events_are_notices() {
+        for text in [
+            "x sets mode:",
+            "x sets mode: ",
+            "x changes topic to '",
+            "x changes topic to",
+            "x was kicked by ",
+            "x was kicked by op junk",
+            "x",
+        ] {
+            let line = format!("[01:02:03] *** {text}");
+            let parsed = parse_line(&line, LogFormat::Znc).unwrap();
+            assert!(parsed.is_event(), "{line}");
+            assert_eq!(parsed.kind, LineKind::Notice { text: text.into() });
+        }
+        assert_eq!(
+            znc_kind("[01:02:03] *** x was kicked by op ("),
+            LineKind::Kick {
+                nick: "x".into(),
+                by: "op".into(),
+                reason: String::new(),
+            }
+        );
     }
 
     #[test]
