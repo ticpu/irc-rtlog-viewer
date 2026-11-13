@@ -256,7 +256,7 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     }
                     " | "
                     a href=(format!("{bp}/{encoded}/today")) { "today" }
-                    " "
+                    " | "
                     a href=(format!("{bp}/{encoded}/{date}/raw")) { "raw" }
                 }
                 div.controls {
