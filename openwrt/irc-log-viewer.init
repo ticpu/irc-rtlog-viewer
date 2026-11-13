@@ -38,6 +38,10 @@ start_service() {
 	client_cert=$(awk '/^ *client_cert:/{print $2}' "$CONF")
 	[ -n "$client_cert" ] && procd_add_jail_mount "$client_cert"
 
+	# OpenGraph cards are cached one file per URL, each replaced by a rename.
+	cache_dir=$(awk '/^ *cache_dir:/{print $2}' "$CONF")
+	[ -n "$cache_dir" ] && procd_add_jail_mount_rw "$cache_dir"
+
 	procd_close_instance
 }
 

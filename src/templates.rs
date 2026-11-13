@@ -58,6 +58,15 @@ pub fn urls(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
         })
 }
 
+/// The part of a line that [`render_line`] passes through [`linkify`].
+pub fn linked_text(kind: &LineKind) -> Option<&str> {
+    match kind {
+        LineKind::Message { text, .. } | LineKind::Action { text, .. } => Some(text),
+        LineKind::Topic { topic, .. } => Some(topic),
+        _ => None,
+    }
+}
+
 pub fn linkify(text: &str) -> Markup {
     let mut result = String::new();
     let mut last = 0;
@@ -264,6 +273,8 @@ pub struct LogPageContext<'a> {
     pub search_max_len: usize,
     /// Whether the presence endpoint is served, which app.js then polls.
     pub presence: bool,
+    /// Whether the embed endpoint serves OpenGraph cards.
+    pub embeds: bool,
 }
 
 pub fn log_page(ctx: &LogPageContext) -> Markup {
@@ -336,7 +347,8 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
             }
             div id="log" class="hide-events" data-date=(date)
                 data-latest=[is_today.then(|| format!("{bp}/{encoded}/latest"))]
-                data-presence=[ctx.presence.then(|| format!("{bp}/{encoded}/presence"))] {
+                data-presence=[ctx.presence.then(|| format!("{bp}/{encoded}/presence"))]
+                data-embed=[ctx.embeds.then(|| format!("{bp}/{encoded}/{date}/embed"))] {
                 @for (line, at) in lines {
                     (render_line(line, at.map(|at| LineTime { at, zone: ctx.zone })))
                 }

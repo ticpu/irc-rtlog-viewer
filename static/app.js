@@ -91,6 +91,44 @@
         return el;
     };
 
+    // OpenGraph cards come from the server, which fetches only links it
+    // finds in the day's log; the href is sent as written, never a.href.
+    var cardEndpoint = (document.getElementById('log') || {dataset: {}}).dataset.embed;
+    var addCard = function(line, box, href) {
+        fetch(cardEndpoint + '?url=' + encodeURIComponent(href)).then(function(resp) {
+            return resp.ok ? resp.json() : null;
+        }).then(function(card) {
+            if (!card || !(card.title || card.description)) return;
+            if (!line.hasAttribute('data-embedded')) return;
+            var a = document.createElement('a');
+            a.className = 'og-card';
+            a.setAttribute('href', href);
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            if (card.image) {
+                var img = document.createElement('img');
+                img.referrerPolicy = 'no-referrer';
+                img.setAttribute('loading', 'lazy');
+                img.alt = '';
+                img.src = card.image;
+                a.appendChild(img);
+            }
+            var text = document.createElement('div');
+            [['og-site', card.site_name], ['og-title', card.title], ['og-desc', card.description]].forEach(function(f) {
+                if (!f[1]) return;
+                var span = document.createElement('span');
+                span.className = f[0];
+                span.textContent = f[1];
+                text.appendChild(span);
+            });
+            a.appendChild(text);
+            box.appendChild(a);
+            if (!box.parentNode) line.appendChild(box);
+        }).catch(function(e) {
+            console.warn('embeds: card for ' + href + ': ' + e.message);
+        });
+    };
+
     var embedLine = function(line) {
         if (line.hasAttribute('data-embedded')) return;
         line.setAttribute('data-embedded', '');
@@ -98,8 +136,13 @@
         box.className = 'embeds';
         var links = line.querySelectorAll('span.msg a[href], span.action a[href]');
         for (var i = 0; i < links.length; i++) {
-            var el = embedFor(links[i].getAttribute('href'));
-            if (el) box.appendChild(el);
+            var href = links[i].getAttribute('href');
+            var el = embedFor(href);
+            if (el) {
+                box.appendChild(el);
+            } else if (cardEndpoint) {
+                addCard(line, box, href);
+            }
         }
         if (box.firstChild) line.appendChild(box);
     };

@@ -105,6 +105,16 @@ The `znc` section is optional and needs `presence`. ZNC never logs NAMES, so the
 | `znc.password` | | The ZNC user's password, instead of `client_cert`; set exactly one of the two |
 | `znc.timeout_secs` | `30` | Time one session may take from connect to the end of the burst |
 
+### Embeds
+
+With "show embeds" on, image, video and YouTube links are embedded by the browser itself. The optional `embeds` section adds OpenGraph cards (title, description, site name and image) for other links. The viewer fetches the page server-side, and only for a link that appears in that day's log exactly as the page shows it. A fetch reaches only public addresses on ports 80 and 443, never this host's own addresses, follows at most 3 redirects, reads at most 512 KiB of HTML and gives up after 5 seconds. With an HTTP(S) proxy set in the environment, host names are resolved by the proxy, so the address check then covers only IP literals and redirect targets. Each result, failures included, is cached for a day as one JSON file per URL. A section that cannot be used is logged and the cards stay off.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `embeds.cache_dir` | *(required)* | Directory for the cached cards, writable by the viewer |
+| `embeds.max_concurrent` | `4` | Card fetches running at once; further requests get 503 |
+| `embeds.per_ip_per_minute` | `60` | Card fetches one client address may start per minute, cache hits excluded; further requests get 429 |
+
 ### Search options
 
 Per-address limits key IPv4 clients by address and IPv6 clients by their /64. Counters live in memory and reset on restart.

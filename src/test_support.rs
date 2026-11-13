@@ -52,6 +52,7 @@ pub fn app_state(channels: ChannelNode, yaml: &str) -> AppState {
         reqwest_client: None,
         presence: None,
         znc: None,
+        embeds: None,
         log_tz: jiff::tz::TimeZone::UTC,
     }
 }

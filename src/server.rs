@@ -21,6 +21,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
+use crate::embed;
 use crate::limits;
 use crate::live::LiveChannel;
 use crate::parser::{LogFormat, parse_line};
@@ -135,6 +136,8 @@ async fn serve_css() -> impl IntoResponse {
 #[derive(Deserialize)]
 struct SearchQuery {
     q: Option<String>,
+    /// The link an embed request is for.
+    url: Option<String>,
 }
 
 async fn wildcard(
@@ -193,14 +196,14 @@ async fn wildcard(
         || last == "presence"
         || last == "ask"
         || looks_like_date(last)
-        || is_date_raw(last, segments.len())
+        || is_date_action(last, segments.len())
     {
         let channel_segments = &segments[..segments.len() - 1];
-        // Handle YYYY-MM-DD/raw
-        let (action, channel_segments) = if last == "raw" && segments.len() >= 2 {
+        // Handle YYYY-MM-DD/raw and YYYY-MM-DD/embed
+        let (action, channel_segments) = if is_date_action(last, segments.len()) {
             let date_seg = segments[segments.len() - 2];
             if looks_like_date(date_seg) {
-                ("raw", &segments[..segments.len() - 2])
+                (last, &segments[..segments.len() - 2])
             } else {
                 (last, channel_segments)
             }
@@ -232,6 +235,10 @@ async fn wildcard(
                 "raw" => {
                     let date = segments[segments.len() - 2].to_owned();
                     off_runtime(move || serve_raw(&channel, &date)).await
+                }
+                "embed" => {
+                    let date = segments[segments.len() - 2].to_owned();
+                    serve_embed(state, channel, date, search.url, addr).await
                 }
                 date if looks_like_date(date) => {
                     let date = date.to_owned();
@@ -324,8 +331,113 @@ async fn off_runtime(f: impl FnOnce() -> Response + Send + 'static) -> Response 
         })
 }
 
-fn is_date_raw(last: &str, len: usize) -> bool {
-    last == "raw" && len >= 2
+/// `YYYY-MM-DD/raw` or `YYYY-MM-DD/embed` after a channel.
+fn is_date_action(last: &str, len: usize) -> bool {
+    matches!(last, "raw" | "embed") && len >= 2
+}
+
+/// Whether `url` is, byte for byte, a link the day's page shows.
+fn is_linked_on(channel: &crate::Channel, date: &str, url: &str) -> bool {
+    let Some((path, format)) = resolve_log_path(channel, date) else {
+        return false;
+    };
+    let Ok(content) = read_log_file(&path) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter_map(|l| parse_line(l, format))
+        .any(|line| {
+            templates::linked_text(&line.kind)
+                .is_some_and(|text| templates::urls(text).any(|span| &text[span] == url))
+        })
+}
+
+/// The OpenGraph card of a link in the day's log, as JSON.
+async fn serve_embed(
+    state: Arc<AppState>,
+    channel: crate::Channel,
+    date: String,
+    url: Option<String>,
+    addr: IpAddr,
+) -> Response {
+    let Some(embeds) = &state.embeds else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let Some(url) = url else {
+        return (StatusCode::BAD_REQUEST, "missing url").into_response();
+    };
+    let check = url.clone();
+    match tokio::task::spawn_blocking(move || is_linked_on(&channel, &date, &check)).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (StatusCode::NOT_FOUND, "not a link in this day's log").into_response();
+        }
+        Err(e) => {
+            eprintln!("embeds: the log check failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    }
+    let card = match url::Url::parse(&url) {
+        Err(_) => embed::Card::default(),
+        Ok(parsed)
+            if embeds
+                .is_cached(&parsed)
+                .await =>
+        {
+            embeds
+                .card(&parsed)
+                .await
+        }
+        Ok(parsed) => {
+            // The slot is taken before the rate token so a busy refusal costs nothing.
+            let Ok(_slot) = Arc::clone(
+                &state
+                    .limits
+                    .embed_slots,
+            )
+            .try_acquire_owned() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "5")],
+                    "card fetches are busy",
+                )
+                    .into_response();
+            };
+            if let Err(wait) = state
+                .limits
+                .charge_embed(addr)
+            {
+                let secs = wait
+                    .as_secs()
+                    .max(1)
+                    .to_string();
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, secs)],
+                    "too many card fetches",
+                )
+                    .into_response();
+            }
+            embeds
+                .card(&parsed)
+                .await
+        }
+    };
+    match serde_json::to_string(&card) {
+        Ok(body) => (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                cache_control("private, max-age=3600"),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(e) => {
+            eprintln!("embeds: cannot serialize a card: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
 }
 
 fn looks_like_date(s: &str) -> bool {
@@ -456,6 +568,9 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
             .max_query_len,
         presence: state
             .presence
+            .is_some(),
+        embeds: state
+            .embeds
             .is_some(),
     })
     .into_response();

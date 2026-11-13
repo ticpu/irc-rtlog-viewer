@@ -33,6 +33,10 @@ base64 = "0.23"
 thiserror = "2"
 ring = "0.17"
 rcgen = "0.14"
+url = "2"
+tl = "0.7"
+html-escape = "0.3"
+if-addrs = "0.15"
 
 [profile.release]
 opt-level = "s"

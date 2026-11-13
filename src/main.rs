@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 use tokio::sync::{RwLock, Semaphore};
 
 mod ai;
+mod embed;
 mod limits;
 mod live;
 mod parser;
@@ -84,6 +85,9 @@ pub struct Config {
     /// Live membership from a ZNC session; needs `presence`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub znc: Option<znc::ZncConfig>,
+    /// OpenGraph cards for links; the embed endpoint 404s when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeds: Option<EmbedsConfig>,
 }
 
 /// Settings for the per-nick archive stamps.
@@ -91,6 +95,26 @@ pub struct Config {
 pub struct PresenceConfig {
     /// YAML file caching the stamps between runs.
     pub index_path: PathBuf,
+}
+
+/// Settings for the OpenGraph card fetcher.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmbedsConfig {
+    /// Directory holding one JSON file per fetched URL.
+    pub cache_dir: PathBuf,
+    /// Card fetches running at once; further requests get 503.
+    #[serde(default = "default_embeds_max_concurrent")]
+    pub max_concurrent: NonZeroUsize,
+    /// Card fetches one client address may start per minute; cache hits are free.
+    #[serde(default = "default_embeds_per_ip_per_minute")]
+    pub per_ip_per_minute: NonZeroU32,
+}
+
+fn default_embeds_max_concurrent() -> NonZeroUsize {
+    NonZeroUsize::new(4).unwrap()
+}
+fn default_embeds_per_ip_per_minute() -> NonZeroU32 {
+    NonZeroU32::new(60).unwrap()
 }
 
 fn default_log_timezone() -> String {
@@ -156,6 +180,7 @@ impl Default for Config {
             log_timezone: default_log_timezone(),
             presence: None,
             znc: None,
+            embeds: None,
         }
     }
 }
@@ -288,6 +313,8 @@ pub struct AppState {
     pub presence: Option<Arc<presence::Presence>>,
     /// The ZNC session runner the tail triggers; `None` without a znc section.
     pub znc: Option<znc::Znc>,
+    /// The OpenGraph card fetcher; `None` without an embeds section.
+    pub embeds: Option<embed::Embeds>,
     /// Messages endpoint, pointed at a local stand-in by tests.
     #[cfg(test)]
     pub api_url: String,
@@ -403,6 +430,10 @@ fn default_config_yaml() -> Result<String, SerializeError> {
         "#  fingerprint: <SHA-256 of the listener certificate>\n",
         "#  client_cert: /etc/irc-log-viewer/znc-client.pem\n",
         "#  timeout_secs: 30\n",
+        "#embeds:\n",
+        "#  cache_dir: /var/lib/irc-logs/embeds\n",
+        "#  max_concurrent: 4\n",
+        "#  per_ip_per_minute: 60\n",
     ));
     Ok(yaml)
 }
@@ -533,6 +564,31 @@ async fn run() {
     let bind = config
         .bind
         .clone();
+    // Like a broken znc section, a fetcher that cannot be built costs the cards only.
+    let embeds = config
+        .embeds
+        .as_ref()
+        .and_then(|e| {
+            let bind_ip = bind
+                .parse::<SocketAddr>()
+                .ok()
+                .map(|a| a.ip())
+                .filter(|ip| !ip.is_unspecified());
+            match embed::Embeds::new(
+                e.cache_dir
+                    .clone(),
+                bind_ip,
+            ) {
+                Ok(embeds) => Some(embeds),
+                Err(e) => {
+                    eprintln!(
+                        "embeds: cannot build the HTTP client: {}; link cards are off",
+                        znc::error_chain(&e)
+                    );
+                    None
+                }
+            }
+        });
     let (ai_semaphore, reqwest_client) = match &config.ai {
         Some(ai) => {
             eprintln!(
@@ -565,6 +621,7 @@ async fn run() {
         presence,
         log_tz,
         znc,
+        embeds,
         #[cfg(test)]
         api_url: crate::ai::ANTHROPIC_MESSAGES_URL.to_owned(),
     });

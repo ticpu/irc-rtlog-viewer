@@ -222,6 +222,36 @@ main {
     background: var(--bg-alt);
 }
 
+.embeds .og-card {
+    display: flex;
+    gap: 0.6em;
+    max-width: min(560px, 100%);
+    padding: 0.4em 0.6em;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    background: var(--bg-alt);
+    color: var(--fg);
+    text-decoration: none;
+}
+
+.embeds .og-card img {
+    max-width: 120px;
+    max-height: 90px;
+    object-fit: cover;
+    border: none;
+}
+
+.og-card div {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15em;
+    min-width: 0;
+}
+
+.og-site { color: var(--fg-dim); font-size: 0.85em; }
+.og-title { color: var(--accent); font-weight: bold; }
+.og-desc { font-size: 0.9em; overflow-wrap: anywhere; }
+
 .date {
     color: var(--fg-dim);
     text-decoration: none;

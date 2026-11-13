@@ -1,4 +1,5 @@
-//! Per-client budgets for AI ask sessions and the plain-text search.
+//! Per-client budgets for AI ask sessions, the plain-text search and
+//! OpenGraph card fetches.
 //!
 //! A client is its IP address: the TCP peer, or the X-Real-IP header when the
 //! peer is listed in `trusted_proxies`. IPv6 clients are keyed by their /64,
@@ -68,6 +69,9 @@ pub struct Limits {
     search_per_address: DefaultKeyedRateLimiter<IpAddr>,
     /// Bounds concurrent plain-text searches.
     pub search_slots: Arc<Semaphore>,
+    embed_per_address: Option<DefaultKeyedRateLimiter<IpAddr>>,
+    /// Bounds concurrent card fetches; one slot when embeds are off.
+    pub embed_slots: Arc<Semaphore>,
     trusted_proxies: Vec<IpAddr>,
 }
 
@@ -98,6 +102,19 @@ impl Limits {
                     .search
                     .max_concurrent
                     .get(),
+            )),
+            embed_per_address: config
+                .embeds
+                .as_ref()
+                .map(|e| RateLimiter::keyed(Quota::per_minute(e.per_ip_per_minute))),
+            embed_slots: Arc::new(Semaphore::new(
+                config
+                    .embeds
+                    .as_ref()
+                    .map_or(1, |e| {
+                        e.max_concurrent
+                            .get()
+                    }),
             )),
             trusted_proxies: config
                 .trusted_proxies
@@ -132,8 +149,24 @@ impl Limits {
             .map_err(|e| e.wait_time_from(now))
     }
 
+    /// Takes one card fetch from the address's budget, or returns the wait.
+    /// Always succeeds when embeds are off.
+    pub fn charge_embed(&self, addr: IpAddr) -> Result<(), Duration> {
+        let Some(limiter) = &self.embed_per_address else {
+            return Ok(());
+        };
+        let now = DefaultClock::default().now();
+        limiter
+            .check_key(&bucket_key(addr))
+            .map_err(|e| e.wait_time_from(now))
+    }
+
     /// Drops buckets that have refilled completely.
     pub fn prune(&self) {
+        if let Some(limiter) = &self.embed_per_address {
+            limiter.retain_recent();
+            limiter.shrink_to_fit();
+        }
         if let Some(ask) = &self.ask {
             ask.per_client
                 .retain_recent();
