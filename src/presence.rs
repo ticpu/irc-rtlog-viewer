@@ -23,7 +23,12 @@
 //! online comes from a join, a message, an action and the new side of a nick
 //! change; offline from a quit, a part, a kick (the kicked nick) and the old
 //! side of a nick change; spoke from messages and actions; the topic from
-//! "changes topic to" lines. Users are keyed by the nick under rfc1459
+//! "changes topic to" lines; the channel modes from the newest
+//! `Server sets mode` line (ZNC's logged 324 reply; a server's own changes
+//! carry its name instead) and the setting changes after it, kept as a
+//! [`ModeHistory`] and replayed with the network's mode table when the JSON
+//! is built. Two changes in the same second replay in sorted, not logged,
+//! order. Users are keyed by the nick under rfc1459
 //! casemapping, the network's CASEMAPPING: ASCII lowercase, plus `[]\~`
 //! folding to `{}|^`.
 //!
@@ -100,12 +105,12 @@ use serde::{Deserialize, Serialize};
 use serde_saphyr::{Budget, SerializerOptions};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::live::LiveChannel;
+use crate::live::{LiveChannel, ModeLine, ModeSpec};
 use crate::parser::{LineKind, LogFormat, LogLine, Time, parse_line};
 use crate::server::read_log_file;
 use crate::{ChannelDir, ChannelNode, yaml_options};
 
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 const PUBLISH_EVERY: Duration = Duration::from_secs(1);
 const SAVE_EVERY: Duration = Duration::from_secs(600);
 
@@ -209,6 +214,78 @@ pub struct ChannelPresence {
     pub topic: Option<Topic>,
     /// Users keyed by rfc1459-casemapped nick.
     pub users: HashMap<String, UserStamps>,
+    /// Channel modes: the latest logged 324 reply and the changes since.
+    pub modes: ModeHistory,
+}
+
+/// The newest full mode set ZNC logged after a join, as
+/// `*** Server sets mode: +nt`, and the channel-mode changes logged at or
+/// after it, sorted. The set is the newest by (time, modes, args), like the
+/// topic, so merging stays order-independent; changes from before it are
+/// dropped. Lines that only change member prefixes or lists are not kept:
+/// they are frequent and never change the channel's settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeHistory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<ModeLine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<ModeLine>,
+}
+
+/// Mode letters that are member prefixes or list entries on common
+/// networks; a line made only of these leaves the channel's settings alone.
+const NOT_SETTINGS: &str = "+-ovhaqbeI";
+
+impl ModeHistory {
+    fn apply(&mut self, nick: &str, line: ModeLine) {
+        if nick == "Server" {
+            self.set_baseline(line);
+        } else if line
+            .modes
+            .chars()
+            .any(|c| !NOT_SETTINGS.contains(c))
+        {
+            self.changes
+                .push(line);
+            self.normalize();
+        }
+    }
+
+    fn set_baseline(&mut self, line: ModeLine) {
+        if self
+            .baseline
+            .as_ref()
+            .is_none_or(|current| &line > current)
+        {
+            self.baseline = Some(line);
+            self.normalize();
+        }
+    }
+
+    fn merge(&mut self, other: &ModeHistory) {
+        if let Some(line) = &other.baseline {
+            self.set_baseline(line.clone());
+        }
+        self.changes
+            .extend(
+                other
+                    .changes
+                    .iter()
+                    .cloned(),
+            );
+        self.normalize();
+    }
+
+    fn normalize(&mut self) {
+        self.changes
+            .sort();
+        self.changes
+            .dedup();
+        if let Some(base) = &self.baseline {
+            self.changes
+                .retain(|line| line.at >= base.at);
+        }
+    }
 }
 
 impl ChannelPresence {
@@ -232,7 +309,17 @@ impl ChannelPresence {
                 text: topic.clone(),
                 at,
             }),
-            LineKind::Mode { .. } | LineKind::Notice { .. } => {}
+            LineKind::Mode { nick, modes, args } => self
+                .modes
+                .apply(
+                    nick,
+                    ModeLine {
+                        at,
+                        modes: modes.clone(),
+                        args: args.clone(),
+                    },
+                ),
+            LineKind::Notice { .. } => {}
         }
     }
 
@@ -241,6 +328,8 @@ impl ChannelPresence {
         if let Some(topic) = &other.topic {
             self.set_topic(topic.clone());
         }
+        self.modes
+            .merge(&other.modes);
         for (key, user) in &other.users {
             self.users
                 .entry(key.clone())
@@ -599,9 +688,12 @@ impl Archive {
                         )
                     })
                     .collect();
+                let mut modes = ModeHistory::default();
+                modes.merge(&channel.modes);
                 let mut presence = ChannelPresence {
                     topic: channel.topic,
                     users: HashMap::new(),
+                    modes,
                 };
                 for user in channel.users {
                     let key = casemap(&user.nick);
@@ -659,6 +751,10 @@ impl Archive {
                         .into_values()
                         .cloned()
                         .collect(),
+                    modes: state
+                        .presence
+                        .modes
+                        .clone(),
                 }
             })
             .collect();
@@ -692,6 +788,12 @@ struct IndexChannel {
     topic: Option<Topic>,
     #[serde(default)]
     users: Vec<UserStamps>,
+    #[serde(default, skip_serializing_if = "is_empty_history")]
+    modes: ModeHistory,
+}
+
+fn is_empty_history(modes: &ModeHistory) -> bool {
+    modes == &ModeHistory::default()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1472,6 +1574,8 @@ struct PresenceJson<'a> {
     snapshot_at: Option<Timestamp>,
     stale: bool,
     topic: Option<TopicJson<'a>>,
+    /// Channel modes such as `+lnt 50`, the +k key left out.
+    modes: Option<String>,
     users: BTreeMap<&'a str, UserJson<'a>>,
 }
 
@@ -1561,6 +1665,22 @@ pub fn json_body(
         snapshot_at: live.map(|l| l.snapshot_at),
         stale: live.is_some_and(|l| l.stale),
         topic: live_topic.or(archive_topic),
+        modes: archive.and_then(|c| {
+            let spec = live.map_or_else(ModeSpec::default, |l| {
+                l.modes
+                    .clone()
+            });
+            c.modes
+                .baseline
+                .as_ref()
+                .map(|base| {
+                    spec.channel_modes(
+                        base,
+                        &c.modes
+                            .changes,
+                    )
+                })
+        }),
         users: users
             .into_values()
             .collect(),
@@ -2070,8 +2190,8 @@ mod tests {
             .path()
             .join("presence.yaml");
         for (content, reason) in [
-            ("version: 1\nchannels: [ {\n", "cannot parse"),
-            ("version: 2\nchannels: []\n", "version 2, expected 1"),
+            ("version: 2\nchannels: [ {\n", "cannot parse"),
+            ("version: 1\nchannels: []\n", "version 1, expected 2"),
             ("", "cannot parse"),
         ] {
             std::fs::write(&index, content).unwrap();
@@ -2191,6 +2311,7 @@ mod tests {
                 "scanning": false,
                 "snapshot_at": null,
                 "stale": false,
+                "modes": null,
                 "topic": {"source": "archive", "nick": "op", "text": "hello", "at": "2026-01-01T10:01:00Z"},
                 "users": {
                     "Foo": {"live": null, "prefixes": "", "online": "2026-01-01T10:00:05Z", "offline": null, "spoke": "2026-01-01T10:00:05Z"},
@@ -2360,6 +2481,80 @@ mod tests {
     }
 
     #[test]
+    fn channel_modes_come_from_the_newest_baseline_and_later_changes() {
+        let root = tempdir();
+        let dir = channel_dir(
+            root.path(),
+            LogFormat::Znc,
+            &[
+                (
+                    "2026-01-01.log",
+                    "[10:00:00] *** Server sets mode: +nt \n[10:05:00] *** op sets mode: +m\n",
+                ),
+                (
+                    "2026-01-02.log",
+                    "[09:00:00] *** Server sets mode: +kst sekrit\n[09:10:00] *** op sets mode: +l 25\n[09:11:00] *** op sets mode: +o bob\n[09:12:00] *** irc.example.org sets mode: +v bob\n",
+                ),
+            ],
+        );
+        let (inputs, _) = scan_dirs(vec![dir], &KnownFiles::new(), &TimeZone::UTC);
+        let files: Vec<ChannelPresence> = inputs
+            .into_iter()
+            .filter_map(|input| match input {
+                Input::File { stamps, .. } => Some(stamps),
+                _ => None,
+            })
+            .collect();
+        let mut forward = ChannelPresence::default();
+        let mut backward = ChannelPresence::default();
+        for file in &files {
+            forward.merge(file);
+        }
+        for file in files
+            .iter()
+            .rev()
+        {
+            backward.merge(file);
+        }
+        assert_eq!(forward, backward);
+        // The day-one +m predates the newest baseline; the +o and +v lines are not settings.
+        assert_eq!(
+            forward.modes,
+            ModeHistory {
+                baseline: Some(ModeLine {
+                    at: ts("2026-01-02T09:00:00Z"),
+                    modes: "+kst".into(),
+                    args: vec!["sekrit".into()],
+                }),
+                changes: vec![ModeLine {
+                    at: ts("2026-01-02T09:10:00Z"),
+                    modes: "+l".into(),
+                    args: vec!["25".into()],
+                }],
+            }
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&json_body(false, Some(&forward), None).unwrap()).unwrap();
+        assert_eq!(body["modes"], "+klst 25");
+
+        let mut archive = Archive::default();
+        archive.absorb_file(
+            "#c".into(),
+            "/x/2026-01-02.log".into(),
+            FileStat {
+                mtime: ts("2026-01-02T00:00:00Z"),
+                size: 1,
+            },
+            &forward,
+        );
+        let index = root
+            .path()
+            .join("presence.yaml");
+        write_index(&index, &archive.to_index()).unwrap();
+        assert_eq!(load_index(&index).unwrap(), archive);
+    }
+
+    #[test]
     fn json_joins_archive_and_live_users() {
         let archive = file_stamps(&[
             ("2026-01-01T00:00:01Z", says("Alice")),
@@ -2384,6 +2579,7 @@ mod tests {
                 "scanning": false,
                 "snapshot_at": null,
                 "stale": false,
+                "modes": null,
                 "topic": {"source": "archive", "nick": "op", "text": "archived", "at": "2026-01-01T00:00:03Z"},
                 "users": {
                     "Alice": {"live": null, "prefixes": "", "online": "2026-01-01T00:00:01Z", "offline": null, "spoke": "2026-01-01T00:00:01Z"},
@@ -2403,6 +2599,7 @@ mod tests {
                 "scanning": false,
                 "snapshot_at": "2026-01-01T01:00:00Z",
                 "stale": true,
+                "modes": null,
                 "topic": {"source": "live", "nick": "op2", "text": "live", "at": "2026-01-01T00:30:00Z"},
                 "users": {
                     "alice": {"live": true, "prefixes": "@", "online": "2026-01-01T00:00:01Z", "offline": null, "spoke": "2026-01-01T00:00:01Z"},

@@ -233,6 +233,7 @@
         var topicBox = document.getElementById('topic');
         var users = {};
         var topic = null;
+        var modes = null;
         var scanning = true;
         var snapshotAt = null;
         var stale = false;
@@ -287,12 +288,11 @@
         };
         var showTopic = function() {
             if (!topicBox) return;
-            if (!topic) {
-                topicBox.hidden = true;
-                return;
-            }
-            topicBox.textContent = 'Topic: ' + topic.text + ' (set by ' + topic.nick + ', ' + when(topic.at) + ')';
-            topicBox.hidden = false;
+            var parts = [];
+            if (modes) parts.push('Modes: ' + modes);
+            if (topic) parts.push('Topic: ' + topic.text + ' (set by ' + topic.nick + ', ' + when(topic.at) + ')');
+            topicBox.textContent = parts.join(' · ');
+            topicBox.hidden = parts.length === 0;
         };
         var render = function() {
             decorate(log);
@@ -321,6 +321,7 @@
                     users[casemap(nick)] = body.users[nick];
                 });
                 topic = body.topic;
+                modes = body.modes;
                 scanning = body.scanning;
                 snapshotAt = body.snapshot_at;
                 stale = body.stale;

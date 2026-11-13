@@ -27,9 +27,10 @@
 //! Members are keyed by the nick under rfc1459 casemapping, as archive users
 //! are, so the endpoint can join the two.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 
 use crate::parser::LineKind;
 use crate::presence::{Topic, casemap};
@@ -39,7 +40,9 @@ use crate::presence::{Topic, casemap};
 pub struct ModeSpec {
     /// Prefix modes from highest rank to lowest, as (mode letter, prefix char).
     pub prefixes: Vec<(char, char)>,
-    /// CHANMODES type A (list) and B (always an argument).
+    /// CHANMODES type A (a list entry, always an argument).
+    pub list: String,
+    /// CHANMODES type B (a setting, always an argument).
     pub always_arg: String,
     /// CHANMODES type C (an argument only when set).
     pub set_arg: String,
@@ -52,11 +55,40 @@ impl Default for ModeSpec {
     fn default() -> Self {
         Self {
             prefixes: vec![('o', '@'), ('v', '+')],
-            always_arg: "beIk".into(),
+            list: "beI".into(),
+            always_arg: "k".into(),
             set_arg: "l".into(),
             no_arg: "imnpst".into(),
         }
     }
+}
+
+/// One mode letter of a mode line, with what it applies to.
+enum ModeStep<'a> {
+    /// A member prefix given to or taken from a nick.
+    Prefix {
+        prefix: char,
+        adding: bool,
+        nick: &'a str,
+    },
+    /// A channel setting, with its argument when it takes one.
+    Setting {
+        letter: char,
+        adding: bool,
+        arg: Option<&'a str>,
+    },
+}
+
+/// One mode line the archive keeps for the channel modes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ModeLine {
+    /// When it was logged.
+    pub at: Timestamp,
+    /// The mode string, such as `+nt` or `-l+k`.
+    pub modes: String,
+    /// Its arguments in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 impl ModeSpec {
@@ -92,7 +124,8 @@ impl ModeSpec {
             if groups.len() < 4 {
                 return false;
             }
-            self.always_arg = format!("{}{}", groups[0], groups[1]);
+            self.list = groups[0].into();
+            self.always_arg = groups[1].into();
             self.set_arg = groups[2].into();
             self.no_arg = groups[3].into();
             return true;
@@ -111,6 +144,105 @@ impl ModeSpec {
             .iter()
             .find(|&&(m, _)| m == mode)
             .map(|&(_, p)| p)
+    }
+
+    /// Walks a mode line, pairing each letter with its argument by this
+    /// table. List entries are skipped. Stops at a letter the table does not
+    /// know, since its arguments cannot be paired after it; returns false then.
+    fn walk<'a>(
+        &self,
+        modes: &str,
+        args: &'a [String],
+        mut step: impl FnMut(ModeStep<'a>),
+    ) -> bool {
+        let mut adding = true;
+        let mut args = args.iter();
+        for letter in modes.chars() {
+            match letter {
+                '+' => adding = true,
+                '-' => adding = false,
+                _ => {
+                    if let Some(prefix) = self.prefix_for_mode(letter) {
+                        let Some(nick) = args.next() else {
+                            return true;
+                        };
+                        step(ModeStep::Prefix {
+                            prefix,
+                            adding,
+                            nick,
+                        });
+                    } else if self
+                        .list
+                        .contains(letter)
+                    {
+                        args.next();
+                    } else if self
+                        .always_arg
+                        .contains(letter)
+                        || (adding
+                            && self
+                                .set_arg
+                                .contains(letter))
+                    {
+                        step(ModeStep::Setting {
+                            letter,
+                            adding,
+                            arg: args
+                                .next()
+                                .map(String::as_str),
+                        });
+                    } else if self
+                        .no_arg
+                        .contains(letter)
+                        || self
+                            .set_arg
+                            .contains(letter)
+                    {
+                        step(ModeStep::Setting {
+                            letter,
+                            adding,
+                            arg: None,
+                        });
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// The channel modes after `baseline` (a 324 reply, the full set) and
+    /// then `changes` in order, as `+letters args`. The +k key is never
+    /// shown; its letter is.
+    pub fn channel_modes(&self, baseline: &ModeLine, changes: &[ModeLine]) -> String {
+        let mut set: BTreeMap<char, Option<&str>> = BTreeMap::new();
+        for line in std::iter::once(baseline).chain(changes) {
+            self.walk(&line.modes, &line.args, |step| {
+                if let ModeStep::Setting {
+                    letter,
+                    adding,
+                    arg,
+                } = step
+                {
+                    if adding {
+                        set.insert(letter, arg.filter(|_| letter != 'k'));
+                    } else {
+                        set.remove(&letter);
+                    }
+                }
+            });
+        }
+        let mut out = String::from("+");
+        out.extend(set.keys());
+        for arg in set
+            .values()
+            .flatten()
+        {
+            out.push(' ');
+            out.push_str(arg);
+        }
+        out
     }
 
     /// Splits a 353 entry such as `@+nick` into its prefixes and nick.
@@ -236,48 +368,26 @@ impl LiveChannel {
     }
 
     fn apply_modes(&mut self, modes: &str, args: &[String]) {
-        let mut adding = true;
-        let mut args = args.iter();
-        for mode in modes.chars() {
-            match mode {
-                '+' => adding = true,
-                '-' => adding = false,
-                _ => {
-                    if let Some(prefix) = self
-                        .modes
-                        .prefix_for_mode(mode)
-                    {
-                        let Some(target) = args.next() else {
-                            return;
-                        };
-                        self.set_prefix(target, prefix, adding);
-                    } else if self
-                        .modes
-                        .always_arg
-                        .contains(mode)
-                        || (adding
-                            && self
-                                .modes
-                                .set_arg
-                                .contains(mode))
-                    {
-                        args.next();
-                    } else if !self
-                        .modes
-                        .no_arg
-                        .contains(mode)
-                        && !self
-                            .modes
-                            .set_arg
-                            .contains(mode)
-                    {
-                        eprintln!(
-                            "live: mode {mode:?} of {modes:?} is not in the network's CHANMODES or PREFIX; ignoring the rest of the line"
-                        );
-                        return;
-                    }
+        let mut changes = Vec::new();
+        let known = self
+            .modes
+            .walk(modes, args, |step| {
+                if let ModeStep::Prefix {
+                    prefix,
+                    adding,
+                    nick,
+                } = step
+                {
+                    changes.push((nick, prefix, adding));
                 }
-            }
+            });
+        if !known {
+            eprintln!(
+                "live: {modes:?} has a mode not in the network's CHANMODES or PREFIX; ignoring the rest of the line"
+            );
+        }
+        for (nick, prefix, adding) in changes {
+            self.set_prefix(nick, prefix, adding);
         }
     }
 
@@ -447,6 +557,38 @@ mod tests {
             twice.apply(at, line);
         }
         assert_eq!(twice, once);
+    }
+
+    fn line(modes: &str, args: &[&str]) -> ModeLine {
+        ModeLine {
+            at: ts("2026-01-01T00:00:00Z"),
+            modes: modes.into(),
+            args: args
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn channel_modes_replay_changes_on_the_baseline_and_hide_the_key() {
+        let base = line("+knst", &["hunter2"]);
+        let changes = [
+            line("+l", &["50"]),
+            line("+bm-n", &["*!*@spam"]),
+            line("+o-l+l", &["op", "10"]),
+        ];
+        let spec = ModeSpec::default();
+        assert_eq!(spec.channel_modes(&base, &changes), "+klmst 10");
+        assert_eq!(
+            spec.channel_modes(&base, &[line("-k", &["hunter2"])]),
+            "+nst"
+        );
+        // OFTC's table: f is type C and q a list, so their arguments pair right.
+        let mut oftc = ModeSpec::default();
+        oftc.apply_isupport("CHANMODES=eIbq,k,flj,CFLMPQScgimnprstuz");
+        let changes = [line("+qfz", &["*!*@x", "3:5"])];
+        assert_eq!(oftc.channel_modes(&line("+nt", &[]), &changes), "+fntz 3:5");
     }
 
     #[test]
