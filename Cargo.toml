@@ -32,6 +32,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 base64 = "0.23"
 thiserror = "2"
 ring = "0.17"
+rcgen = "0.14"
 
 [profile.release]
 opt-level = "s"
@@ -41,5 +42,4 @@ codegen-units = 1
 panic = "abort"
 
 [dev-dependencies]
-rcgen = "0.14"
 tower = { version = "0.5", features = ["util"] }

@@ -30,6 +30,7 @@ mod templates;
 #[cfg(test)]
 mod test_support;
 mod znc;
+mod znc_conf;
 
 use parser::LogFormat;
 
@@ -38,6 +39,10 @@ use parser::LogFormat;
 struct Cli {
     #[arg(short, long, default_value = "config.yaml")]
     config: PathBuf,
+    /// Print a znc: section for this ZNC config, create the client
+    /// certificate it names, and exit.
+    #[arg(short = 'z', long = "znc", value_name = "ZNC_CONF")]
+    znc: Option<PathBuf>,
 }
 
 /// Deserialized `config.yaml`.
@@ -444,6 +449,36 @@ async fn run() {
     let mut root = ChannelNode::default();
     for dir in &logs_dirs {
         discover_channels(dir, &[], &mut root);
+    }
+
+    if let Some(znc_conf) = &cli.znc {
+        let client_cert = config
+            .znc
+            .as_ref()
+            .and_then(|z| {
+                z.client_cert
+                    .clone()
+            })
+            .unwrap_or_else(|| {
+                std::path::absolute(&cli.config)
+                    .ok()
+                    .and_then(|c| {
+                        c.parent()
+                            .map(Path::to_path_buf)
+                    })
+                    .unwrap_or_default()
+                    .join("znc-client.pem")
+            });
+        match znc_conf::generate(znc_conf, &client_cert, &presence::channel_keys(&root)) {
+            Ok(text) => {
+                print!("{text}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("-z: {}", znc::error_chain(&e));
+                std::process::exit(1);
+            }
+        }
     }
 
     let presence = config

@@ -23,7 +23,7 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
 irc-log-viewer -c config.yaml
 ```
 
-On first run, if the config file doesn't exist, a default one is created and the program exits.
+On first run, if the config file doesn't exist, a default one is created and the program exits. `-z <znc.conf>` prints a `znc:` section for that ZNC and exits; see ZNC integration below.
 
 ## Configuration
 
@@ -158,7 +158,15 @@ openssl s_client -connect '[::1]:7778' </dev/null 2>/dev/null | openssl x509 -no
 
 ### Setting up certauth
 
-Generate the client certificate (here with openssl; any self-signed certificate works) and enrol its SHA-256 with certauth from an IRC client logged in as a ZNC admin:
+The quickest way is to let the viewer read ZNC's own config:
+
+```sh
+irc-log-viewer -c config.yaml -z /etc/znc/configs/znc.conf
+```
+
+It prints a `znc:` section to paste into the config: the first listener with IRC and SSL on (a loopback one first), each user and network (the first live, the others commented), the channel path found under `logs_dirs`, and the SHA-256 of ZNC's SSLCertFile. It creates the client certificate at `znc.client_cert`, or `znc-client.pem` beside the config, with mode 0600, and prints the certauth commands that enrol it. An existing certificate file is reused, never overwritten. It reads no other value from znc.conf, so passwords and hashes never reach its output. Run it as a user that can read znc.conf and SSLCertFile, then make the client certificate readable by the user the viewer runs as.
+
+To do the same by hand, generate the client certificate (here with openssl; any self-signed certificate works) and enrol its SHA-256 with certauth from an IRC client logged in as a ZNC admin:
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 36500 -subj /CN=irc-log-viewer -keyout znc-client.pem -out znc-client.pem
