@@ -23,6 +23,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::AppState;
 use crate::limits;
 use crate::parser::{LogFormat, parse_line};
+use crate::presence::{ChannelPresence, json_body};
 use crate::search::search_channel;
 use crate::templates;
 
@@ -188,6 +189,7 @@ async fn wildcard(
     if last == "today"
         || last == "latest"
         || last == "search"
+        || last == "presence"
         || last == "ask"
         || looks_like_date(last)
         || is_date_raw(last, segments.len())
@@ -224,6 +226,7 @@ async fn wildcard(
                         .unwrap_or_default();
                     search_with_limits(state, channel, query, addr).await
                 }
+                "presence" => serve_presence(&state, &channel, &headers).await,
                 "ask" => serve_ask_page(&state, &channel, &headers),
                 "raw" => {
                     let date = segments[segments.len() - 2].to_owned();
@@ -518,6 +521,97 @@ fn serve_raw(channel: &crate::Channel, date: &str) -> Response {
     }
 }
 
+/// Channels with more users than this build their presence JSON on the blocking pool.
+const PRESENCE_INLINE_USERS: usize = 1000;
+
+/// The channel's archive stamps as JSON, tagged with a hash of the body.
+async fn serve_presence(
+    state: &AppState,
+    channel: &crate::Channel,
+    headers: &HeaderMap,
+) -> Response {
+    let Some(presence) = &state.presence else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let scanning = presence.scanning();
+    let snapshot = presence.channel(
+        &channel
+            .path_segments
+            .join("/"),
+    );
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| {
+            v.to_str()
+                .ok()
+        })
+        .map(str::to_owned);
+    let large = snapshot
+        .as_ref()
+        .is_some_and(|c| {
+            c.users
+                .len()
+                > PRESENCE_INLINE_USERS
+        });
+    let respond =
+        move || presence_response(scanning, snapshot.as_deref(), if_none_match.as_deref());
+    if large {
+        off_runtime(respond).await
+    } else {
+        respond()
+    }
+}
+
+fn presence_response(
+    scanning: bool,
+    channel: Option<&ChannelPresence>,
+    if_none_match: Option<&str>,
+) -> Response {
+    let body = match json_body(scanning, channel) {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!("presence: cannot serialize the JSON body: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+    let etag = format!("\"{}\"", content_version(&body));
+    let cc = cache_control("private, max-age=30");
+    if if_none_match.is_some_and(|inm| etag_matches(inm, &etag)) {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [cc, (header::ETAG, etag.as_str())],
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            cc,
+            (header::ETAG, etag.as_str()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// If-None-Match under RFC 9110's weak comparison: `*`, or any listed tag
+/// equal to `etag` once `W/` is dropped. Cloudflare weakens tags it compresses.
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    let ours = etag
+        .strip_prefix("W/")
+        .unwrap_or(etag);
+    if_none_match
+        .split(',')
+        .map(str::trim)
+        .any(|tag| {
+            tag == "*"
+                || tag
+                    .strip_prefix("W/")
+                    .unwrap_or(tag)
+                    == ours
+        })
+}
+
 async fn serve_sse(
     state: Arc<AppState>,
     channel: &crate::Channel,
@@ -545,9 +639,11 @@ async fn serve_sse(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// A day file's text, decompressed when it ends in `.zst`. Invalid UTF-8 is
+/// replaced with U+FFFD, as in the tail, so one stray byte does not cost the whole day.
 pub fn read_log_file(path: &Path) -> io::Result<String> {
     let file = std::fs::File::open(path)?;
-    let mut content = String::new();
+    let mut bytes = Vec::new();
 
     if path
         .extension()
@@ -555,13 +651,14 @@ pub fn read_log_file(path: &Path) -> io::Result<String> {
         == Some("zst")
     {
         let mut decoder = zstd::Decoder::new(BufReader::new(file))?;
-        decoder.read_to_string(&mut content)?;
+        decoder.read_to_end(&mut bytes)?;
     } else {
         let mut reader = BufReader::new(file);
-        reader.read_to_string(&mut content)?;
+        reader.read_to_end(&mut bytes)?;
     }
 
-    Ok(content)
+    Ok(String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 pub fn resolve_log_path(
@@ -1042,6 +1139,43 @@ mod tests {
                 .unwrap();
             let body = String::from_utf8(body.to_vec()).unwrap();
             assert!(body.contains("needle"), "{uri}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_in_a_log_is_replaced_not_fatal() {
+        let root = tempdir();
+        std::fs::write(
+            root.path()
+                .join("2026-01-01.log"),
+            b"2026-01-01T00:00:00Z <a> caf\xe9 needle\n",
+        )
+        .unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: root
+                .path()
+                .to_owned(),
+            format: LogFormat::Iso8601,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        let app = app(Arc::new(app_state(channels, "logs_dirs: []")), PEER);
+        for uri in ["/%23c/2026-01-01", "/%23c/2026-01-01/raw"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::get(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("caf\u{fffd} needle"), "{uri}: {body}");
         }
     }
 

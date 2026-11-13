@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use clap::Parser;
+use jiff::tz::TimeZone;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_saphyr::SerializeError;
@@ -20,6 +21,7 @@ use tokio::sync::{RwLock, Semaphore};
 mod ai;
 mod limits;
 mod parser;
+mod presence;
 mod search;
 mod server;
 mod tail;
@@ -62,8 +64,31 @@ pub struct Config {
     /// AI search settings; the ask endpoints 404 when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai: Option<AiConfig>,
+    /// Zone of the times in ZNC-format logs: an IANA name or a POSIX TZ string.
+    /// Left out of the default file, which lists it commented.
+    #[serde(
+        default = "default_log_timezone",
+        skip_serializing_if = "is_default_log_timezone"
+    )]
+    pub log_timezone: String,
+    /// Archive stamps per nick; the presence endpoint 404s when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<PresenceConfig>,
 }
 
+/// Settings for the per-nick archive stamps.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PresenceConfig {
+    /// YAML file caching the stamps between runs.
+    pub index_path: PathBuf,
+}
+
+fn default_log_timezone() -> String {
+    "UTC".into()
+}
+fn is_default_log_timezone(name: &str) -> bool {
+    name == "UTC"
+}
 fn default_trusted_proxies() -> Vec<IpAddr> {
     vec![Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()]
 }
@@ -118,6 +143,8 @@ impl Default for Config {
             trusted_proxies: default_trusted_proxies(),
             search: SearchConfig::default(),
             ai: None,
+            log_timezone: default_log_timezone(),
+            presence: None,
         }
     }
 }
@@ -244,6 +271,8 @@ pub struct AppState {
     pub reqwest_client: Option<reqwest::Client>,
     /// Per-client budgets for ask and search.
     pub limits: limits::Limits,
+    /// Archive stamps; `None` when the presence section is absent.
+    pub presence: Option<Arc<presence::Presence>>,
     /// Messages endpoint, pointed at a local stand-in by tests.
     #[cfg(test)]
     pub api_url: String,
@@ -275,12 +304,46 @@ pub fn install_crypto_provider() {
     }
 }
 
-/// Parses `config.yaml`. Errors carry line and column but no excerpt of the
-/// input, which could quote `ai.api_key` into the service log.
+/// Parses `config.yaml`.
 pub fn parse_config(content: &str) -> Result<Config, serde_saphyr::Error> {
+    serde_saphyr::from_str_with_options(content, yaml_options())
+}
+
+/// Deserializer options for the YAML files the viewer reads. Errors carry
+/// line and column but no excerpt of the input, which could quote
+/// `ai.api_key` into the service log.
+pub fn yaml_options() -> serde_saphyr::Options {
     let mut options = serde_saphyr::Options::default();
     options.with_snippet = false;
-    serde_saphyr::from_str_with_options(content, options)
+    options
+}
+
+/// Resolves `log_timezone`: UTC, an IANA name from the system tzdb, else a
+/// POSIX TZ string such as `EST5EDT,M3.2.0,M11.1.0`, which needs no tzdb.
+fn resolve_log_timezone(name: &str) -> Result<TimeZone, String> {
+    resolve_log_timezone_in(name, jiff::tz::db())
+}
+
+/// [`resolve_log_timezone`] against `db`. UTC, the default, resolves without
+/// one: a ujail has no zoneinfo, and bare `UTC` is not a POSIX TZ string.
+fn resolve_log_timezone_in(
+    name: &str,
+    db: &jiff::tz::TimeZoneDatabase,
+) -> Result<TimeZone, String> {
+    if ["UTC", "Etc/UTC", "Z"]
+        .iter()
+        .any(|utc| utc.eq_ignore_ascii_case(name))
+    {
+        return Ok(TimeZone::UTC);
+    }
+    db.get(name)
+        .or_else(|iana| {
+            TimeZone::posix(name).map_err(|posix| {
+                format!(
+                    "not a time zone in the system tzdb ({iana}) nor a POSIX TZ string ({posix})"
+                )
+            })
+        })
 }
 
 /// The config file written when none exists: the defaults, then the
@@ -301,6 +364,9 @@ fn default_config_yaml() -> Result<String, SerializeError> {
         "#  system_prompt: |\n",
         "#    Custom system prompt text here.\n",
         "#    The channel list is always appended automatically.\n",
+        "#log_timezone: UTC\n",
+        "#presence:\n",
+        "#  index_path: /var/lib/irc-logs/presence.yaml\n",
     ));
     Ok(yaml)
 }
@@ -354,10 +420,27 @@ async fn run() {
         })
         .collect();
 
+    let log_tz = resolve_log_timezone(&config.log_timezone).unwrap_or_else(|e| {
+        eprintln!("invalid log_timezone {:?}: {e}", config.log_timezone);
+        std::process::exit(1);
+    });
+
     let mut root = ChannelNode::default();
     for dir in &logs_dirs {
         discover_channels(dir, &[], &mut root);
     }
+
+    let presence = config
+        .presence
+        .as_ref()
+        .map(|p| {
+            presence::start(
+                p.index_path
+                    .clone(),
+                log_tz,
+                &root,
+            )
+        });
 
     let bind = config
         .bind
@@ -391,6 +474,7 @@ async fn run() {
         ai_semaphore,
         reqwest_client,
         limits,
+        presence,
         #[cfg(test)]
         api_url: crate::ai::ANTHROPIC_MESSAGES_URL.to_owned(),
     });
@@ -426,6 +510,12 @@ async fn run() {
         shutdown_signal().await;
         let _ = stop.send(true);
     });
+    let presence_saved = tokio::spawn(save_presence_on_signal(
+        state
+            .presence
+            .clone(),
+        stopping.clone(),
+    ));
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -447,11 +537,35 @@ async fn run() {
             SHUTDOWN_GRACE.as_secs()
         ),
     }
+    if let Err(e) = presence_saved.await {
+        eprintln!("presence: the shutdown write task failed: {e}");
+    }
     // The tail thread holds no state; stopping it lets the runtime shut down.
     drop(tail);
 }
 
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Once shutdown is signalled, has presence write its index, giving up when
+/// the grace runs out so the whole shutdown stays within it.
+async fn save_presence_on_signal(
+    presence: Option<Arc<presence::Presence>>,
+    stopping: tokio::sync::watch::Receiver<bool>,
+) {
+    signalled(stopping).await;
+    let Some(presence) = presence else {
+        return;
+    };
+    if tokio::time::timeout(SHUTDOWN_GRACE, presence.shutdown())
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "presence: index not written within {} s of the signal",
+            SHUTDOWN_GRACE.as_secs()
+        );
+    }
+}
 
 /// Resolves once shutdown has been signalled, or its sender is gone.
 async fn signalled(mut stopping: tokio::sync::watch::Receiver<bool>) {
@@ -639,6 +753,36 @@ mod tests {
     }
 
     #[test]
+    fn log_timezone_resolves_utc_and_posix_without_a_tzdb() {
+        let none = jiff::tz::TimeZoneDatabase::none();
+        let default = Config::default().log_timezone;
+        for name in [default.as_str(), "utc", "Etc/UTC", "Z"] {
+            let tz = resolve_log_timezone_in(name, &none).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(tz, TimeZone::UTC, "{name}");
+        }
+        let posix = resolve_log_timezone_in("EST5EDT,M3.2.0,M11.1.0", &none).unwrap();
+        assert_eq!(
+            posix
+                .to_offset(
+                    "2026-01-01T00:00:00Z"
+                        .parse()
+                        .unwrap()
+                )
+                .seconds(),
+            -5 * 3600
+        );
+        let err = resolve_log_timezone_in("America/Toronto", &none).unwrap_err();
+        assert!(err.contains("POSIX TZ string ("), "{err}");
+    }
+
+    #[test]
+    fn log_timezone_errors_give_both_lookups() {
+        let err = resolve_log_timezone("Not/A_Zone").unwrap_err();
+        assert!(err.contains("Not/A_Zone"), "{err}");
+        assert!(err.contains("POSIX TZ string ("), "{err}");
+    }
+
+    #[test]
     fn config_errors_locate_without_quoting_the_input() {
         let yaml = "logs_dirs: []\nai:\n  api_key: sk-secret\n  max_concurrent: x\n";
         let err = parse_config(yaml)
@@ -666,6 +810,9 @@ search:
   per_ip_per_minute: 30
   max_query_len: 200
   max_days: 365
+log_timezone: EST5EDT,M3.2.0,M11.1.0
+presence:
+  index_path: /var/lib/irc-logs/presence.yaml
 ai:
   api_key: placeholder
   model: claude-haiku-5-5
@@ -700,6 +847,14 @@ ai:
                 .search
                 .max_days,
             365
+        );
+        assert!(resolve_log_timezone(&config.log_timezone).is_ok());
+        assert_eq!(
+            config
+                .presence
+                .unwrap()
+                .index_path,
+            PathBuf::from("/var/lib/irc-logs/presence.yaml"),
         );
         let ai = config
             .ai

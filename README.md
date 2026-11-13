@@ -45,6 +45,9 @@ search:
   per_ip_per_minute: 30
   max_query_len: 200
   max_days: 365
+log_timezone: EST5EDT,M3.2.0,M11.1.0
+presence:
+  index_path: /var/lib/irc-logs/presence.yaml
 ai:
   api_key: sk-ant-api03-...
   model: claude-haiku-5-5
@@ -69,6 +72,17 @@ ai:
 | `logs_dirs` | `[./logs]` | List of directories containing IRC log channels |
 | `base_path` | *(empty)* | URL prefix for reverse proxy subpath deployments (e.g. `/irc`) |
 | `trusted_proxies` | `[127.0.0.1, ::1]` | Peers whose `X-Real-IP` header is taken as the client address for per-address limits; from any other peer the TCP address is used |
+| `log_timezone` | `UTC` | Time zone of the times in ZNC-format logs: `UTC`, an IANA name from the system tzdb (`America/Toronto`), or a POSIX TZ string (`EST5EDT,M3.2.0,M11.1.0`). It is the zone ZNC ran in when it wrote them. ISO 8601 logs are always UTC. Under the OpenWrt ujail there is no zoneinfo, so only `UTC` and POSIX strings resolve there; an IANA name needs `TZDIR` or a zoneinfo mount. |
+
+### Presence
+
+The `presence` section is optional. When set, the viewer scans the archive in the background for each nick's last online (join, message, action, nick change to it), last offline (quit, part, kick, nick change from it) and last spoke (message, action), and for each channel's latest topic change. `GET <channel>/presence` returns them as JSON: `scanning` (true until the startup scan is done), `topic` (`nick`, `text`, `at`) or null, and `users`, mapping each nick to its `online`, `offline` and `spoke`, null when never seen. Stamps are RFC 3339 UTC. Without the section the route answers 404.
+
+The index file is a disposable cache: at startup only new or changed log files are read, and deleting the index makes the next start rescan everything. Stamps only move forward, so a deleted or rewritten log keeps its contributions until the index is deleted. The index's directory must be writable by the viewer.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `presence.index_path` | *(required)* | YAML file caching the stamps between runs, written after the scan, every 10 minutes when something changed, and at shutdown |
 
 ### Search options
 

@@ -24,6 +24,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1"
 zstd = "0.14"
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-zoneinfo", "serde"] }
+arc-swap = "1"
+tempfile = "3"
 
 [profile.release]
 opt-level = "s"
@@ -34,4 +37,3 @@ panic = "abort"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-tempfile = "3"

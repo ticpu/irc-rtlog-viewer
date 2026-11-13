@@ -30,6 +30,10 @@ start_service() {
 	output_dir=$(awk '/^ *output_dir:/{print $2}' "$CONF")
 	[ -n "$output_dir" ] && procd_add_jail_mount_rw "$output_dir"
 
+	# The index is replaced by a rename, so its whole directory is mounted.
+	index_path=$(awk '/^ *index_path:/{print $2}' "$CONF")
+	[ -n "$index_path" ] && procd_add_jail_mount_rw "$(dirname "$index_path")"
+
 	procd_close_instance
 }
 

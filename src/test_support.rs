@@ -50,6 +50,7 @@ pub fn app_state(channels: ChannelNode, yaml: &str) -> AppState {
         sse_senders: RwLock::new(HashMap::new()),
         ai_semaphore: None,
         reqwest_client: None,
+        presence: None,
     }
 }
 
