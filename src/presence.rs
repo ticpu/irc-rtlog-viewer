@@ -1943,6 +1943,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_page_points_at_presence_only_when_it_is_on() {
+        let root = tempdir();
+        let tree = || {
+            let dir = channel_dir(
+                root.path(),
+                LogFormat::Znc,
+                &[("2026-01-01.log", "[10:00:00] <Foo[x]> hi\n")],
+            );
+            let mut channels = ChannelNode::default();
+            add_channel(&mut channels, &["#c"], vec![dir]);
+            channels
+        };
+        let presence = start(
+            root.path()
+                .join("presence.yaml"),
+            TimeZone::UTC,
+            &tree(),
+        );
+        for on in [true, false] {
+            let mut state = app_state(tree(), "logs_dirs: []");
+            state.presence = on.then(|| Arc::clone(&presence));
+            let app = app(Arc::new(state), "192.0.2.1:4000");
+            let (status, _, body) = get(&app, "/%23c/2026-01-01", None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body.contains(r#"data-nick="Foo[x]""#), "{body}");
+            for wired in [
+                r#"data-presence="/%23c/presence""#,
+                r#"<p id="topic" hidden"#,
+                r#"<select id="tz-select""#,
+            ] {
+                assert_eq!(
+                    body.contains(wired),
+                    on,
+                    "{wired} with presence {on}: {body}"
+                );
+            }
+        }
+        presence
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
     async fn presence_route_is_absent_without_the_section() {
         let mut channels = ChannelNode::default();
         add_channel(&mut channels, &["#c"], Vec::new());

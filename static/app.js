@@ -136,6 +136,134 @@
         });
     }
 
+    // The JSON keys users by display nick; lookups go through the network's
+    // rfc1459 casemapping, as the server's index does.
+    var RFC1459_UPPER = {'[': '{', ']': '}', '\\': '|', '~': '^'};
+    var casemap = function(nick) {
+        return nick.replace(/[A-Z[\]\\~]/g, function(c) {
+            return RFC1459_UPPER[c] || c.toLowerCase();
+        });
+    };
+
+    // Called with each line the tail appends; set when presence is on.
+    var onNewLine = null;
+    if (log && log.dataset.presence) {
+        var presenceUrl = log.dataset.presence;
+        var topicBox = document.getElementById('topic');
+        var tzSelect = document.getElementById('tz-select');
+        var users = {};
+        var topic = null;
+        var scanning = true;
+        var stampFormat = null;
+
+        var useZone = function(zone) {
+            var options = {dateStyle: 'medium', timeStyle: 'medium'};
+            if (zone) options.timeZone = zone;
+            try {
+                stampFormat = new Intl.DateTimeFormat(undefined, options);
+                return true;
+            } catch (e) {
+                stampFormat = new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'medium'});
+                return false;
+            }
+        };
+        var when = function(stamp) {
+            return stampFormat.format(new Date(stamp));
+        };
+        var hoverText = function(nick) {
+            var user = users[casemap(nick)];
+            if (!user) return scanning ? 'archive scan in progress' : 'not seen in the archive';
+            var lines = [];
+            if (user.online) lines.push('last online: ' + when(user.online));
+            if (user.offline) lines.push('last offline: ' + when(user.offline));
+            if (user.spoke) lines.push('last spoke: ' + when(user.spoke));
+            return lines.join('\n');
+        };
+        var decorate = function(root) {
+            var nicks = root.querySelectorAll('span.nick[data-nick]');
+            for (var i = 0; i < nicks.length; i++) {
+                nicks[i].title = hoverText(nicks[i].getAttribute('data-nick'));
+            }
+        };
+        var showTopic = function() {
+            if (!topicBox) return;
+            if (!topic) {
+                topicBox.hidden = true;
+                return;
+            }
+            topicBox.textContent = 'Topic: ' + topic.text + ' (set by ' + topic.nick + ', ' + when(topic.at) + ')';
+            topicBox.hidden = false;
+        };
+        var render = function() {
+            decorate(log);
+            showTopic();
+        };
+
+        var zone = localStorage.getItem('tz');
+        if (!useZone(zone)) {
+            console.warn('presence: dropping unknown time zone ' + zone);
+            localStorage.removeItem('tz');
+            zone = null;
+        }
+        if (tzSelect) {
+            var browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            tzSelect.options[0].textContent = 'browser time zone (' + browserZone + ')';
+            var zones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
+            if (zones.indexOf('UTC') === -1) zones = ['UTC'].concat(zones);
+            if (zone && zones.indexOf(zone) === -1) zones = [zone].concat(zones);
+            for (var z = 0; z < zones.length; z++) {
+                var option = document.createElement('option');
+                option.value = zones[z];
+                option.textContent = zones[z];
+                tzSelect.appendChild(option);
+            }
+            tzSelect.value = zone || '';
+            tzSelect.addEventListener('change', function() {
+                if (tzSelect.value) {
+                    localStorage.setItem('tz', tzSelect.value);
+                } else {
+                    localStorage.removeItem('tz');
+                }
+                useZone(tzSelect.value || null);
+                render();
+            });
+        }
+
+        var timer = null;
+        var load;
+        var schedule = function(ms) {
+            if (timer !== null) return;
+            timer = setTimeout(function() {
+                timer = null;
+                load();
+            }, ms);
+        };
+        // no-cache revalidates with the ETag; max-age alone would serve
+        // a stale copy for 30 s after a line arrived.
+        load = function() {
+            fetch(presenceUrl, {cache: 'no-cache'}).then(function(resp) {
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                return resp.json();
+            }).then(function(body) {
+                users = {};
+                Object.keys(body.users).forEach(function(nick) {
+                    users[casemap(nick)] = body.users[nick];
+                });
+                topic = body.topic;
+                scanning = body.scanning;
+                render();
+                if (scanning) schedule(5000);
+            }).catch(function(e) {
+                console.warn('presence: ' + presenceUrl + ': ' + e.message);
+            });
+        };
+        load();
+        onNewLine = function(line) {
+            decorate(line);
+            schedule(5000);
+        };
+    }
+
     if (log && log.dataset.latest) {
         var tail = new EventSource(log.dataset.latest);
         var atBottom = true;
@@ -145,8 +273,9 @@
         tail.onmessage = function(e) {
             log.insertAdjacentHTML('beforeend', e.data);
             var added = log.lastElementChild;
-            if (embeds && embeds.checked && added && added.classList.contains('line')) {
-                embedLine(added);
+            if (added && added.classList.contains('line')) {
+                if (embeds && embeds.checked) embedLine(added);
+                if (onNewLine) onNewLine(added);
             }
             if (atBottom) window.scrollTo(0, document.body.scrollHeight);
         };

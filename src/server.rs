@@ -436,6 +436,9 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
             .config
             .search
             .max_query_len,
+        presence: state
+            .presence
+            .is_some(),
     })
     .into_response();
     let cc = if is_today {

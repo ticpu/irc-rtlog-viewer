@@ -19,6 +19,13 @@ fn nick_color_style(nick: &str) -> String {
     format!("color:hsl({},70%,65%)", nick_hue(nick))
 }
 
+/// A nick, coloured, carrying `data-nick` for the presence script.
+fn nick_span(nick: &str) -> Markup {
+    html! {
+        span.nick data-nick=(nick) style=(nick_color_style(nick)) { (nick) }
+    }
+}
+
 pub fn linkify(text: &str) -> Markup {
     let mut result = String::new();
     let mut last = 0;
@@ -81,14 +88,14 @@ pub fn render_line(line: &LogLine) -> Markup {
             " "
             @match &line.kind {
                 LineKind::Message { nick, text } => {
-                    span.nick style=(nick_color_style(nick)) { "<" (nick) ">" }
+                    span.nick data-nick=(nick) style=(nick_color_style(nick)) { "<" (nick) ">" }
                     " "
                     span.msg { (linkify(text)) }
                 },
                 LineKind::Action { nick, text } => {
                     span.action {
                         "* "
-                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        (nick_span(nick))
                         " "
                         (linkify(text))
                     }
@@ -96,14 +103,14 @@ pub fn render_line(line: &LogLine) -> Markup {
                 LineKind::Join { nick, userhost } => {
                     span.ev {
                         "→ "
-                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        (nick_span(nick))
                         " (" (userhost) ") joined"
                     }
                 },
                 LineKind::Quit { nick, userhost, reason } => {
                     span.ev {
                         "← "
-                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        (nick_span(nick))
                         " (" (userhost) ") quit"
                         @if !reason.is_empty() {
                             " (" (reason) ")"
@@ -113,7 +120,7 @@ pub fn render_line(line: &LogLine) -> Markup {
                 LineKind::Part { nick, userhost, reason } => {
                     span.ev {
                         "← "
-                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        (nick_span(nick))
                         " (" (userhost) ") left"
                         @if !reason.is_empty() {
                             " (" (reason) ")"
@@ -122,17 +129,17 @@ pub fn render_line(line: &LogLine) -> Markup {
                 },
                 LineKind::NickChange { old_nick, new_nick } => {
                     span.ev {
-                        span.nick style=(nick_color_style(old_nick)) { (old_nick) }
+                        (nick_span(old_nick))
                         " → "
-                        span.nick style=(nick_color_style(new_nick)) { (new_nick) }
+                        (nick_span(new_nick))
                     }
                 },
                 LineKind::Kick { nick, by, reason } => {
                     span.ev {
                         "⨯ "
-                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        (nick_span(nick))
                         " was kicked by "
-                        span.nick style=(nick_color_style(by)) { (by) }
+                        (nick_span(by))
                         @if !reason.is_empty() {
                             " (" (reason) ")"
                         }
@@ -140,14 +147,14 @@ pub fn render_line(line: &LogLine) -> Markup {
                 },
                 LineKind::Topic { nick, topic } => {
                     span.ev {
-                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        (nick_span(nick))
                         " changed the topic to: "
                         (linkify(topic))
                     }
                 },
                 LineKind::Mode { nick, modes, args } => {
                     span.ev {
-                        span.nick style=(nick_color_style(nick)) { (nick) }
+                        (nick_span(nick))
                         " sets mode " (modes)
                         @for arg in args {
                             " " (arg)
@@ -223,6 +230,8 @@ pub struct LogPageContext<'a> {
     pub ai_enabled: bool,
     pub base_path: &'a str,
     pub search_max_len: usize,
+    /// Whether the presence endpoint is served, which app.js then polls.
+    pub presence: bool,
 }
 
 pub fn log_page(ctx: &LogPageContext) -> Markup {
@@ -244,6 +253,9 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
         html! {
             header id="log-header" {
                 h1 { (&channel.name) " — " (date) }
+                @if ctx.presence {
+                    p id="topic" hidden {}
+                }
                 div.nav-links {
                     @if let Some(prev) = prev_date {
                         a href=(format!("{bp}/{encoded}/{prev}")) { "← " (prev) }
@@ -274,6 +286,12 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                         input id="toggle-embeds" type="checkbox";
                         " show embeds"
                     }
+                    @if ctx.presence {
+                        " "
+                        select id="tz-select" title="Time zone of the times shown when hovering a nick" {
+                            option value="" { "browser time zone" }
+                        }
+                    }
                     " "
                     form.search-form action=(format!("{bp}/{encoded}/search")) method="get" {
                         input type="text" name="q" placeholder="search…" maxlength=(ctx.search_max_len);
@@ -286,7 +304,9 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                     }
                 }
             }
-            div id="log" class="hide-events" data-latest=[is_today.then(|| format!("{bp}/{encoded}/latest"))] {
+            div id="log" class="hide-events"
+                data-latest=[is_today.then(|| format!("{bp}/{encoded}/latest"))]
+                data-presence=[ctx.presence.then(|| format!("{bp}/{encoded}/presence"))] {
                 @for line in lines {
                     (render_line(line))
                 }
@@ -338,14 +358,14 @@ pub fn search_page(
                         " "
                         @match &line.kind {
                             LineKind::Message { nick, text } => {
-                                span.nick style=(nick_color_style(nick)) { "<" (nick) ">" }
+                                span.nick data-nick=(nick) style=(nick_color_style(nick)) { "<" (nick) ">" }
                                 " "
                                 span.msg { (linkify(text)) }
                             },
                             LineKind::Action { nick, text } => {
                                 span.action {
                                     "* "
-                                    span.nick style=(nick_color_style(nick)) { (nick) }
+                                    (nick_span(nick))
                                     " "
                                     (linkify(text))
                                 }

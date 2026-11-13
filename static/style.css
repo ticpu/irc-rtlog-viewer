@@ -113,6 +113,20 @@ main {
     user-select: none;
 }
 
+#topic {
+    color: var(--fg-dim);
+    margin-bottom: 0.5em;
+    overflow-wrap: anywhere;
+}
+
+#tz-select {
+    background: var(--bg-alt);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    font-family: var(--font);
+    max-width: 14em;
+}
+
 .search-form {
     display: inline-flex;
     gap: 0.3em;
