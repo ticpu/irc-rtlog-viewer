@@ -211,10 +211,10 @@ fn parse_znc(line: &str) -> Option<LogLine> {
 fn parse_znc_event(time: Time, rest: &str) -> Option<LogLine> {
     if let Some(rest) = rest.strip_prefix("Joins: ") {
         // nick (~user@host)
-        let paren = rest.find(" (")?;
-        let nick = rest[..paren].to_string();
-        let end = rest.find(')')?;
-        let userhost = rest[paren + 2..end].to_string();
+        let (nick, after) = rest.split_once(" (")?;
+        let nick = nick.to_string();
+        let (userhost, _) = after.split_once(')')?;
+        let userhost = userhost.to_string();
         Some(LogLine {
             time,
             kind: LineKind::Join { nick, userhost },
@@ -292,12 +292,11 @@ fn parse_nick_event(rest: &str) -> Option<LineKind> {
 
 fn parse_quit_or_part(time: Time, rest: &str, is_quit: bool) -> Option<LogLine> {
     // nick (~user@host) (reason)
-    let paren = rest.find(" (")?;
-    let nick = rest[..paren].to_string();
-    let close = rest.find(')')?;
-    let userhost = rest[paren + 2..close].to_string();
+    let (nick, after) = rest.split_once(" (")?;
+    let nick = nick.to_string();
+    let (userhost, reason_part) = after.split_once(')')?;
+    let userhost = userhost.to_string();
 
-    let reason_part = &rest[close + 1..];
     let reason = if let Some(reason_part) = reason_part.strip_prefix(" (") {
         reason_part
             .strip_suffix(')')
@@ -565,6 +564,40 @@ mod tests {
             LineKind::Join {
                 nick: "lxdr046342".into(),
                 userhost: "~lxdr@51-15-4-54.rev.poneytelecom.eu".into(),
+            }
+        );
+    }
+
+    /// Shapes from bit-rotted archive files, where a `)` precedes the ` (`.
+    #[test]
+    fn test_znc_join_quit_part_with_a_paren_in_the_nick() {
+        assert_eq!(
+            znc_kind("[09:14:01] *** Joins: madwoo|a ) (~Ma$@0002bd2e.usmr.ftc.net("),
+            LineKind::Notice {
+                text: "Joins: madwoo|a ) (~Ma$@0002bd2e.usmr.ftc.net(".into()
+            }
+        );
+        assert_eq!(
+            znc_kind("[09:14:01] *** Joins: a)b (~u@h)"),
+            LineKind::Join {
+                nick: "a)b".into(),
+                userhost: "~u@h".into(),
+            }
+        );
+        assert_eq!(
+            znc_kind("[09:14:01] *** Quits: a)b (~u@h) (bye)"),
+            LineKind::Quit {
+                nick: "a)b".into(),
+                userhost: "~u@h".into(),
+                reason: "bye".into(),
+            }
+        );
+        assert_eq!(
+            znc_kind("[09:14:01] *** Parts: a)b (~u@h)"),
+            LineKind::Part {
+                nick: "a)b".into(),
+                userhost: "~u@h".into(),
+                reason: String::new(),
             }
         );
     }
