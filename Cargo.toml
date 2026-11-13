@@ -43,3 +43,14 @@ panic = "abort"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+# Tests and iteration: optimised enough to run fast, no LTO so rebuilds stay
+# incremental. `make release` keeps the size-optimised release profile.
+[profile.quick]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16
+incremental = true
+strip = false
+panic = "unwind"

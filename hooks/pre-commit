@@ -23,7 +23,7 @@ if ! doc_output=$(RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_lin
 fi
 
 echo "Running tests..."
-if ! test_output=$(cargo test --release 2>&1); then
+if ! test_output=$(cargo test --profile quick 2>&1); then
     echo "$test_output" | tail
     echo "❌ Tests failed. Fix them before committing."
     exit 1
