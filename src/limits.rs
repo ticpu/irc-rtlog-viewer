@@ -236,7 +236,7 @@ mod tests {
     use super::*;
 
     fn limits(yaml: &str) -> Limits {
-        Limits::new(&serde_yaml::from_str(yaml).unwrap())
+        Limits::new(&crate::parse_config(yaml).unwrap())
     }
 
     fn ip(addr: &str) -> IpAddr {

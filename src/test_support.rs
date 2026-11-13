@@ -15,7 +15,7 @@ use axum::extract::connect_info::MockConnectInfo;
 
 use crate::limits::Limits;
 use crate::parser::LogFormat;
-use crate::{AppState, Channel, ChannelDir, ChannelNode, Config};
+use crate::{AppState, Channel, ChannelDir, ChannelNode, parse_config};
 
 pub fn add_channel(root: &mut ChannelNode, segments: &[&str], dirs: Vec<ChannelDir>) {
     let mut node = root;
@@ -40,7 +40,7 @@ pub fn add_channel(root: &mut ChannelNode, segments: &[&str], dirs: Vec<ChannelD
 
 /// State over `channels` with the config parsed from `yaml`.
 pub fn app_state(channels: ChannelNode, yaml: &str) -> AppState {
-    let config: Config = serde_yaml::from_str(yaml).unwrap();
+    let config = parse_config(yaml).unwrap();
     AppState {
         limits: Limits::new(&config),
         api_url: crate::ai::ANTHROPIC_MESSAGES_URL.to_owned(),

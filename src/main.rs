@@ -12,6 +12,7 @@ use axum::Router;
 use clap::Parser;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
+use serde_saphyr::SerializeError;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, Semaphore};
@@ -274,6 +275,36 @@ pub fn install_crypto_provider() {
     }
 }
 
+/// Parses `config.yaml`. Errors carry line and column but no excerpt of the
+/// input, which could quote `ai.api_key` into the service log.
+pub fn parse_config(content: &str) -> Result<Config, serde_saphyr::Error> {
+    let mut options = serde_saphyr::Options::default();
+    options.with_snippet = false;
+    serde_saphyr::from_str_with_options(content, options)
+}
+
+/// The config file written when none exists: the defaults, then the
+/// optional settings commented out.
+fn default_config_yaml() -> Result<String, SerializeError> {
+    let mut yaml = serde_saphyr::to_string(&Config::default())?;
+    yaml.push_str(concat!(
+        "#base_path: /irc\n",
+        "#ai:\n",
+        "#  api_key: sk-ant-api03-...\n",
+        "#  model: claude-haiku-5-5\n",
+        "#  output_dir: /var/lib/irc-logs/ask\n",
+        "#  max_concurrent: 1\n",
+        "#  max_tool_calls: 100\n",
+        "#  max_query_len: 500\n",
+        "#  requests_per_day_per_client: 100\n",
+        "#  requests_per_day_per_ip: 250\n",
+        "#  system_prompt: |\n",
+        "#    Custom system prompt text here.\n",
+        "#    The channel list is always appended automatically.\n",
+    ));
+    Ok(yaml)
+}
+
 async fn run() {
     let cli = Cli::parse();
 
@@ -285,28 +316,15 @@ async fn run() {
             eprintln!("cannot read config {:?}: {e}", cli.config);
             std::process::exit(1);
         });
-        serde_yaml::from_str(&content).unwrap_or_else(|e| {
+        parse_config(&content).unwrap_or_else(|e| {
             eprintln!("invalid config {:?}: {e}", cli.config);
             std::process::exit(1);
         })
     } else {
-        let config = Config::default();
-        let mut yaml = serde_yaml::to_string(&config).unwrap();
-        yaml.push_str(concat!(
-            "#base_path: /irc\n",
-            "#ai:\n",
-            "#  api_key: sk-ant-api03-...\n",
-            "#  model: claude-haiku-5-5\n",
-            "#  output_dir: /var/lib/irc-logs/ask\n",
-            "#  max_concurrent: 1\n",
-            "#  max_tool_calls: 100\n",
-            "#  max_query_len: 500\n",
-            "#  requests_per_day_per_client: 100\n",
-            "#  requests_per_day_per_ip: 250\n",
-            "#  system_prompt: |\n",
-            "#    Custom system prompt text here.\n",
-            "#    The channel list is always appended automatically.\n",
-        ));
+        let yaml = default_config_yaml().unwrap_or_else(|e| {
+            eprintln!("cannot serialize default config: {e}");
+            std::process::exit(1);
+        });
         std::fs::write(&cli.config, &yaml).unwrap_or_else(|e| {
             eprintln!("cannot write default config {:?}: {e}", cli.config);
             std::process::exit(1);
@@ -603,5 +621,96 @@ mod tests {
         }
         found.sort();
         assert_eq!(found, ["#top", "OFTC/#chan"]);
+    }
+
+    #[test]
+    fn default_config_file_loads_back_to_the_defaults() {
+        let yaml = default_config_yaml().unwrap();
+        let loaded = parse_config(&yaml).unwrap();
+        assert!(
+            loaded
+                .ai
+                .is_none()
+        );
+        assert_eq!(
+            serde_saphyr::to_string(&loaded).unwrap(),
+            serde_saphyr::to_string(&Config::default()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn config_errors_locate_without_quoting_the_input() {
+        let yaml = "logs_dirs: []\nai:\n  api_key: sk-secret\n  max_concurrent: x\n";
+        let err = parse_config(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 4"), "{err}");
+        assert!(!err.contains("sk-secret"), "{err}");
+    }
+
+    #[test]
+    fn readme_example_config_parses() {
+        let yaml = r#"
+bind: "[::]:8080"
+title: IRC Logs
+search_limit: 10000
+base_path: /irc
+logs_dirs:
+- /mnt/data/irc-log-archive
+- /mnt/data/znc/log
+trusted_proxies:
+- 127.0.0.1
+- ::1
+search:
+  max_concurrent: 2
+  per_ip_per_minute: 30
+  max_query_len: 200
+  max_days: 365
+ai:
+  api_key: placeholder
+  model: claude-haiku-5-5
+  output_dir: /var/lib/irc-logs/ask
+  max_concurrent: 1
+  max_tool_calls: 100
+  max_query_len: 500
+  requests_per_day_per_client: 100
+  requests_per_day_per_ip: 250
+  system_prompt: |
+    Custom system prompt here.
+    The channel list is always appended automatically.
+"#;
+        let config = parse_config(yaml).unwrap();
+        assert_eq!(config.bind, "[::]:8080");
+        assert_eq!(
+            config.logs_dirs,
+            [
+                PathBuf::from("/mnt/data/irc-log-archive"),
+                PathBuf::from("/mnt/data/znc/log"),
+            ],
+        );
+        assert_eq!(
+            config.trusted_proxies,
+            [
+                IpAddr::from(Ipv4Addr::LOCALHOST),
+                IpAddr::from(Ipv6Addr::LOCALHOST),
+            ],
+        );
+        assert_eq!(
+            config
+                .search
+                .max_days,
+            365
+        );
+        let ai = config
+            .ai
+            .unwrap();
+        assert_eq!(ai.model, "claude-haiku-5-5");
+        assert_eq!(
+            ai.system_prompt
+                .as_deref(),
+            Some(
+                "Custom system prompt here.\nThe channel list is always appended automatically.\n"
+            ),
+        );
     }
 }
