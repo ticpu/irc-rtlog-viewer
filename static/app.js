@@ -260,6 +260,72 @@
         });
     }
 
+    // The server sends a bridged long message only when its attachment is named
+    // after the line's nick; the text replaces the notice, folded and tagged.
+    var fullMessageEndpoint = log ? log.dataset.fullMessage : null;
+    var foldLines = log ? parseInt(log.dataset.fold, 10) || 0 : 0;
+    var expandFullMessages = function(root) {
+        if (!fullMessageEndpoint) return;
+        var spans = root.querySelectorAll('span.msg[data-full-message]');
+        for (var i = 0; i < spans.length; i++) {
+            expandFullMessage(spans[i]);
+        }
+    };
+    var expandFullMessage = function(span) {
+        var href = span.getAttribute('data-full-message');
+        span.removeAttribute('data-full-message');
+        var nickEl = span.parentElement.querySelector('span.nick[data-nick]');
+        if (!nickEl) return;
+        fetch(fullMessageEndpoint + '?url=' + encodeURIComponent(href) +
+            '&nick=' + encodeURIComponent(nickEl.getAttribute('data-nick'))).then(function(resp) {
+            return resp.ok ? resp.json() : null;
+        }).then(function(body) {
+            if (!body || typeof body.text !== 'string') return;
+            var lines = body.text.replace(/\n+$/, '').split('\n');
+            var box = document.createElement('span');
+            box.className = 'full-message';
+            var text = document.createElement('span');
+            text.className = 'full-text';
+            box.appendChild(text);
+            var folded = foldLines > 0 && lines.length > foldLines;
+            var show = function(all) {
+                text.textContent = (all || !folded ? lines : lines.slice(0, foldLines)).join('\n') +
+                    (body.truncated && (all || !folded) ? '\n…' : '');
+            };
+            show(false);
+            var tag = document.createElement('span');
+            tag.className = 'full-tag';
+            if (folded) {
+                var more = document.createElement('a');
+                more.href = '#';
+                var open = false;
+                var label = function() {
+                    more.textContent = open ? 'fold' : 'show ' + (lines.length - foldLines) + ' more lines';
+                };
+                label();
+                more.addEventListener('click', function(ev) {
+                    ev.preventDefault();
+                    open = !open;
+                    show(open);
+                    label();
+                });
+                tag.appendChild(more);
+                tag.appendChild(document.createTextNode(' · '));
+            }
+            var source = document.createElement('a');
+            source.setAttribute('href', href);
+            source.target = '_blank';
+            source.rel = 'noopener noreferrer';
+            source.textContent = 'full message via ' + body.host;
+            tag.appendChild(source);
+            box.appendChild(tag);
+            span.replaceChildren(box);
+        }).catch(function(e) {
+            console.warn('full message ' + href + ': ' + e.message);
+        });
+    };
+    if (log) expandFullMessages(log);
+
     // The JSON keys users by display nick; lookups go through the network's
     // rfc1459 casemapping, as the server's index does.
     var RFC1459_UPPER = {'[': '{', ']': '}', '\\': '|', '~': '^'};
@@ -392,6 +458,7 @@
             var added = log.lastElementChild;
             if (added && added.classList.contains('line')) {
                 showLineTimes(added);
+                expandFullMessages(added);
                 if (embeds && embeds.checked) embedLine(added);
                 if (onNewLine) onNewLine(added);
             }

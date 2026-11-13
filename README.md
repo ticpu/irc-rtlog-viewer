@@ -107,13 +107,17 @@ The `znc` section is optional and needs `presence`. ZNC never logs NAMES, so the
 
 ### Embeds
 
-With "show embeds" on, image, video and YouTube links are embedded by the browser itself. The optional `embeds` section adds OpenGraph cards (title, description, site name and image) for other links. The viewer fetches the page server-side, and only for a link that appears in that day's log exactly as the page shows it. A fetch reaches only public addresses on ports 80 and 443, never this host's own addresses, follows at most 3 redirects, reads at most 512 KiB of HTML and gives up after 5 seconds. With an HTTP(S) proxy set in the environment, host names are resolved by the proxy, so the address check then covers only IP literals and redirect targets. Each result, failures included, is cached for a day as one JSON file per URL. A section that cannot be used is logged and the cards stay off.
+With "show embeds" on, image, video and YouTube links are embedded by the browser itself. The optional `embeds` section adds OpenGraph cards (title, description, site name and image) for other links. The viewer fetches the page server-side, and only for a link that appears in that day's log exactly as the page shows it. A fetch reaches only public addresses on ports 80 and 443, never this host's own addresses, follows at most 3 redirects, reads at most 512 KiB of HTML and gives up after 5 seconds. With an HTTP(S) proxy set in the environment, host names are resolved by the proxy, so the address check then covers only IP literals and redirect targets. Results are cached as one JSON file per URL under `<cache_dir>/<host>/`, so removing a host's directory clears that site; nothing deletes entries on its own. A card is refetched after a day, a long message (below) is kept for good, and a failure of either is retried after a day. A section that cannot be used is logged and the cards stay off.
+
+The same section also expands Matrix bridge long messages, whether or not "show embeds" is on. When a line ends with `(full message at <URL>)` and the URL is https on a host in `embeds.full_message_hosts` under a `media` path, the viewer fetches it as `text/plain` and shows the text in place of the notice, folded after `embeds.full_message_lines` lines and tagged "full message via <host>" with a link to the original. Anyone can link any upload, so the text is shown only when the attachment's filename, which the bridge sets to `<nick>_<time>.txt`, starts with the nick of the line. At most 64 KiB is kept, and the text is inserted as plain text, never as HTML. The raw log, search and the AI tools keep the original short line.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `embeds.cache_dir` | *(required)* | Directory for the cached cards, writable by the viewer |
-| `embeds.max_concurrent` | `4` | Card fetches running at once; further requests get 503 |
-| `embeds.per_ip_per_minute` | `60` | Card fetches one client address may start per minute, cache hits excluded; further requests get 429 |
+| `embeds.cache_dir` | *(required)* | Directory for the cache, writable by the viewer |
+| `embeds.max_concurrent` | `4` | Card and long-message fetches running at once; further requests get 503 |
+| `embeds.per_ip_per_minute` | `60` | Card and long-message fetches one client address may start per minute, cache hits excluded; further requests get 429 |
+| `embeds.full_message_hosts` | `[matrix.org]` | Hosts whose bridged long messages are expanded; an empty list turns it off |
+| `embeds.full_message_lines` | `5` | Lines of a long message shown before it folds; 0 never folds |
 
 ### Search options
 

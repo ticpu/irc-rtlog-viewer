@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use cookie::{Cookie, SameSite};
 use percent_encoding::percent_decode_str;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -24,7 +24,7 @@ use crate::AppState;
 use crate::embed;
 use crate::limits;
 use crate::live::LiveChannel;
-use crate::parser::{LogFormat, parse_line};
+use crate::parser::{LineKind, LogFormat, parse_line};
 use crate::presence::{ChannelPresence, json_body};
 use crate::search::search_channel;
 use crate::templates;
@@ -138,6 +138,8 @@ struct SearchQuery {
     q: Option<String>,
     /// The link an embed request is for.
     url: Option<String>,
+    /// The nick of the line a long-message request is for.
+    nick: Option<String>,
 }
 
 async fn wildcard(
@@ -240,6 +242,10 @@ async fn wildcard(
                     let date = segments[segments.len() - 2].to_owned();
                     serve_embed(state, channel, date, search.url, addr).await
                 }
+                "fullmsg" => {
+                    let date = segments[segments.len() - 2].to_owned();
+                    serve_full_message(state, channel, date, search.url, search.nick, addr).await
+                }
                 date if looks_like_date(date) => {
                     let date = date.to_owned();
                     off_runtime(move || serve_log_page(&state, &channel, &date)).await
@@ -331,9 +337,9 @@ async fn off_runtime(f: impl FnOnce() -> Response + Send + 'static) -> Response 
         })
 }
 
-/// `YYYY-MM-DD/raw` or `YYYY-MM-DD/embed` after a channel.
+/// `YYYY-MM-DD/raw`, `/embed` or `/fullmsg` after a channel.
 fn is_date_action(last: &str, len: usize) -> bool {
-    matches!(last, "raw" | "embed") && len >= 2
+    matches!(last, "raw" | "embed" | "fullmsg") && len >= 2
 }
 
 /// Whether `url` is, byte for byte, a link the day's page shows.
@@ -351,6 +357,155 @@ fn is_linked_on(channel: &crate::Channel, date: &str, url: &str) -> bool {
             templates::linked_text(&line.kind)
                 .is_some_and(|text| templates::urls(text).any(|span| &text[span] == url))
         })
+}
+
+/// A slot and a rate token for one remote fetch, or the refusal to send.
+fn fetch_slot(
+    state: &AppState,
+    addr: IpAddr,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Box<Response>> {
+    // The slot is taken before the rate token so a busy refusal costs nothing.
+    let slot = Arc::clone(
+        &state
+            .limits
+            .embed_slots,
+    )
+    .try_acquire_owned()
+    .map_err(|_| {
+        Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "5".to_owned())],
+                "link fetches are busy",
+            )
+                .into_response(),
+        )
+    })?;
+    state
+        .limits
+        .charge_embed(addr)
+        .map_err(|wait| {
+            let secs = wait
+                .as_secs()
+                .max(1)
+                .to_string();
+            Box::new(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, secs)],
+                    "too many link fetches",
+                )
+                    .into_response(),
+            )
+        })?;
+    Ok(slot)
+}
+
+/// Whether `nick` posted, in the day's log, a long-message notice linking `url`.
+/// Several nicks may link one upload, so the line is named by both.
+fn has_full_message_notice(channel: &crate::Channel, date: &str, nick: &str, url: &str) -> bool {
+    let Some((path, format)) = resolve_log_path(channel, date) else {
+        return false;
+    };
+    let Ok(content) = read_log_file(&path) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter_map(|l| parse_line(l, format))
+        .any(|line| match &line.kind {
+            LineKind::Message { nick: n, text } | LineKind::Action { nick: n, text } => {
+                n == nick && templates::full_message_url(text) == Some(url)
+            }
+            _ => false,
+        })
+}
+
+/// The bridged long message `nick`'s line of the day's log links, as JSON:
+/// its text when the attachment is named after that nick, else `{}`.
+async fn serve_full_message(
+    state: Arc<AppState>,
+    channel: crate::Channel,
+    date: String,
+    url: Option<String>,
+    nick: Option<String>,
+    addr: IpAddr,
+) -> Response {
+    let Some(embeds) = &state.embeds else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let (Some(url), Some(nick)) = (url, nick) else {
+        return (StatusCode::BAD_REQUEST, "missing url or nick").into_response();
+    };
+    let Some(parsed) = url::Url::parse(&url)
+        .ok()
+        .filter(|u| embeds.expands(u))
+    else {
+        return (StatusCode::NOT_FOUND, "not an expandable link").into_response();
+    };
+    let (check_url, check_nick) = (url.clone(), nick.clone());
+    match tokio::task::spawn_blocking(move || {
+        has_full_message_notice(&channel, &date, &check_nick, &check_url)
+    })
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                "no long-message notice by this nick for this link",
+            )
+                .into_response();
+        }
+        Err(e) => {
+            eprintln!("embeds: the log check failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    }
+    let _slot = if embeds
+        .is_cached(&parsed, embed::Kind::FullMessage)
+        .await
+    {
+        None
+    } else {
+        match fetch_slot(&state, addr) {
+            Ok(slot) => Some(slot),
+            Err(refused) => return *refused,
+        }
+    };
+    #[derive(Serialize)]
+    struct Body<'a> {
+        text: &'a str,
+        truncated: bool,
+        host: &'a str,
+    }
+    let message = embeds
+        .full_message(&parsed, &nick)
+        .await;
+    let body = match &message {
+        Some(m) => serde_json::to_string(&Body {
+            text: &m.text,
+            truncated: m.truncated,
+            host: parsed
+                .host_str()
+                .unwrap_or_default(),
+        }),
+        None => Ok("{}".to_owned()),
+    };
+    match body {
+        Ok(body) => (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                cache_control("private, max-age=3600"),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(e) => {
+            eprintln!("embeds: cannot serialize a long message: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
 }
 
 /// The OpenGraph card of a link in the day's log, as JSON.
@@ -382,7 +537,7 @@ async fn serve_embed(
         Err(_) => embed::Card::default(),
         Ok(parsed)
             if embeds
-                .is_cached(&parsed)
+                .is_cached(&parsed, embed::Kind::Card)
                 .await =>
         {
             embeds
@@ -390,35 +545,10 @@ async fn serve_embed(
                 .await
         }
         Ok(parsed) => {
-            // The slot is taken before the rate token so a busy refusal costs nothing.
-            let Ok(_slot) = Arc::clone(
-                &state
-                    .limits
-                    .embed_slots,
-            )
-            .try_acquire_owned() else {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [(header::RETRY_AFTER, "5")],
-                    "card fetches are busy",
-                )
-                    .into_response();
+            let _slot = match fetch_slot(&state, addr) {
+                Ok(slot) => slot,
+                Err(refused) => return *refused,
             };
-            if let Err(wait) = state
-                .limits
-                .charge_embed(addr)
-            {
-                let secs = wait
-                    .as_secs()
-                    .max(1)
-                    .to_string();
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [(header::RETRY_AFTER, secs)],
-                    "too many card fetches",
-                )
-                    .into_response();
-            }
             embeds
                 .card(&parsed)
                 .await
@@ -572,6 +702,19 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
         embeds: state
             .embeds
             .is_some(),
+        full_message_lines: state
+            .config
+            .embeds
+            .as_ref()
+            .filter(|e| {
+                state
+                    .embeds
+                    .is_some()
+                    && !e
+                        .full_message_hosts
+                        .is_empty()
+            })
+            .map(|e| e.full_message_lines),
     })
     .into_response();
     let cc = if is_today {

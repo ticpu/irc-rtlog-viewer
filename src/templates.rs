@@ -94,6 +94,24 @@ fn trim_url_end(url: &str) -> usize {
     }
 }
 
+/// The URL of a Matrix bridge's long-message notice: a message ending in
+/// `(full message at <URL>)`, the URL being one [`urls`] finds.
+pub fn full_message_url(text: &str) -> Option<&str> {
+    let start = text.rfind("(full message at <")? + "(full message at <".len();
+    let rest = &text[start..];
+    let end = rest.find(">)")?;
+    if !rest[end + 2..]
+        .trim()
+        .is_empty()
+    {
+        return None;
+    }
+    let url = &rest[..end];
+    urls(text)
+        .any(|span| &text[span] == url)
+        .then_some(url)
+}
+
 /// The part of a line that [`render_line`] passes through [`linkify`].
 pub fn linked_text(kind: &LineKind) -> Option<&str> {
     match kind {
@@ -164,7 +182,7 @@ pub fn render_line(line: &LogLine, time: Option<LineTime>) -> Markup {
                 LineKind::Message { nick, text } => {
                     span.nick data-nick=(nick) style=(nick_color_style(nick)) { "<" (nick) ">" }
                     " "
-                    span.msg { (linkify(text)) }
+                    span.msg data-full-message=[full_message_url(text)] { (linkify(text)) }
                 },
                 LineKind::Action { nick, text } => {
                     span.action {
@@ -311,6 +329,8 @@ pub struct LogPageContext<'a> {
     pub presence: bool,
     /// Whether the embed endpoint serves OpenGraph cards.
     pub embeds: bool,
+    /// Lines shown of an expanded long message, `None` when they are not expanded.
+    pub full_message_lines: Option<usize>,
 }
 
 pub fn log_page(ctx: &LogPageContext) -> Markup {
@@ -384,7 +404,9 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
             div id="log" class="hide-events" data-date=(date)
                 data-latest=[is_today.then(|| format!("{bp}/{encoded}/latest"))]
                 data-presence=[ctx.presence.then(|| format!("{bp}/{encoded}/presence"))]
-                data-embed=[ctx.embeds.then(|| format!("{bp}/{encoded}/{date}/embed"))] {
+                data-embed=[ctx.embeds.then(|| format!("{bp}/{encoded}/{date}/embed"))]
+                data-full-message=[ctx.full_message_lines.map(|_| format!("{bp}/{encoded}/{date}/fullmsg"))]
+                data-fold=[ctx.full_message_lines] {
                 @for (line, at) in lines {
                     (render_line(line, at.map(|at| LineTime { at, zone: ctx.zone })))
                 }

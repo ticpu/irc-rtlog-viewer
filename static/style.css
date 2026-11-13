@@ -360,3 +360,23 @@ main.standalone { margin: 0 auto; max-width: 800px; padding: 1em; overflow-wrap:
     #ask-form input[type="text"] { width: 100%; }
     #ask-result { height: 50vh; }
 }
+
+.full-message {
+    display: inline-block;
+    vertical-align: top;
+    max-width: 100%;
+}
+
+.full-text {
+    display: block;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.full-tag {
+    display: block;
+    font-size: 0.8em;
+    color: var(--fg-dim);
+}
+
+.full-tag a { color: var(--fg-dim); }

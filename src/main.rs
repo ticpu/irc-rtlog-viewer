@@ -108,6 +108,19 @@ pub struct EmbedsConfig {
     /// Card fetches one client address may start per minute; cache hits are free.
     #[serde(default = "default_embeds_per_ip_per_minute")]
     pub per_ip_per_minute: NonZeroU32,
+    /// Hosts whose Matrix bridge "(full message at <url>)" links are expanded; empty turns it off.
+    #[serde(default = "default_full_message_hosts")]
+    pub full_message_hosts: Vec<String>,
+    /// Lines of an expanded message shown before it folds.
+    #[serde(default = "default_full_message_lines")]
+    pub full_message_lines: usize,
+}
+
+fn default_full_message_hosts() -> Vec<String> {
+    vec!["matrix.org".into()]
+}
+fn default_full_message_lines() -> usize {
+    5
 }
 
 fn default_embeds_max_concurrent() -> NonZeroUsize {
@@ -434,6 +447,8 @@ fn default_config_yaml() -> Result<String, SerializeError> {
         "#  cache_dir: /var/lib/irc-logs/embeds\n",
         "#  max_concurrent: 4\n",
         "#  per_ip_per_minute: 60\n",
+        "#  full_message_hosts: [matrix.org]\n",
+        "#  full_message_lines: 5\n",
     ));
     Ok(yaml)
 }
@@ -578,6 +593,8 @@ async fn run() {
                 e.cache_dir
                     .clone(),
                 bind_ip,
+                e.full_message_hosts
+                    .clone(),
             ) {
                 Ok(embeds) => Some(embeds),
                 Err(e) => {
