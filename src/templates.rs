@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use jiff::Timestamp;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
@@ -27,40 +29,48 @@ fn nick_span(nick: &str) -> Markup {
     }
 }
 
+/// The byte ranges of the `http://` and `https://` URLs in `text`, each
+/// running to the next whitespace. Every link a page shows comes from
+/// here, so the embed check sees exactly the URLs a reader can click.
+pub fn urls(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut last = 0;
+    text.match_indices("http")
+        .filter_map(move |(i, _)| {
+            if i < last {
+                return None;
+            }
+            let rest = &text[i..];
+            let scheme_end = if rest.starts_with("https://") {
+                8
+            } else if rest.starts_with("http://") {
+                7
+            } else {
+                return None;
+            };
+            if scheme_end >= rest.len() {
+                return None;
+            }
+            let url_end = rest[scheme_end..]
+                .find(char::is_whitespace)
+                .map_or(rest.len(), |p| scheme_end + p);
+            last = i + url_end;
+            Some(i..last)
+        })
+}
+
 pub fn linkify(text: &str) -> Markup {
     let mut result = String::new();
     let mut last = 0;
 
-    for (i, _) in text.match_indices("http") {
-        if i < last {
-            continue;
-        }
-        let rest = &text[i..];
-        let scheme_end = if rest.starts_with("https://") {
-            8
-        } else if rest.starts_with("http://") {
-            7
-        } else {
-            continue;
-        };
-
-        if scheme_end >= rest.len() {
-            continue;
-        }
-
-        let url_end = rest[scheme_end..]
-            .find(|c: char| c.is_whitespace())
-            .map(|p| scheme_end + p)
-            .unwrap_or(rest.len());
-
-        let url = &rest[..url_end];
-        let before = &text[last..i];
+    for span in urls(text) {
+        let url = &text[span.clone()];
+        let before = &text[last..span.start];
 
         result.push_str(&maud::html! { (before) }.into_string());
         result.push_str(
             &maud::html! { a href=(url) target="_blank" rel="noopener" { (url) } }.into_string(),
         );
-        last = i + url_end;
+        last = span.end;
     }
 
     if last < text.len() {
@@ -496,6 +506,28 @@ mod tests {
         assert!(out.contains(r#"<a href="https://example.com/""#));
         assert!(out.contains("see "));
         assert!(out.contains(" here"));
+    }
+
+    #[test]
+    fn urls_are_exactly_the_links_linkify_makes() {
+        let text = "a https://x.org/p?q=1 b http://y c httpx://no e\thttp://z/ahttp://w";
+        let found: Vec<&str> = urls(text)
+            .map(|r| &text[r])
+            .collect();
+        assert_eq!(
+            found,
+            ["https://x.org/p?q=1", "http://y", "http://z/ahttp://w"]
+        );
+        let html = linkify(text).into_string();
+        let hrefs: Vec<&str> = html
+            .split(r#"href=""#)
+            .skip(1)
+            .filter_map(|s| {
+                s.split('"')
+                    .next()
+            })
+            .collect();
+        assert_eq!(hrefs, found);
     }
 
     #[test]
