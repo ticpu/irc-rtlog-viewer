@@ -1,6 +1,7 @@
 //! Per-nick archive stamps (last online, last offline, last spoke) and the
 //! latest topic of each channel, computed from the log files in the
-//! background, cached in a YAML index, and served by the presence endpoint.
+//! background, cached in a YAML index, and served by the presence endpoint
+//! together with the live snapshot a ZNC session provides.
 //!
 //! # Stamps are maxima of UTC timestamps
 //!
@@ -40,12 +41,25 @@
 //! # Ownership
 //!
 //! One actor task owns the mutable state and takes [`Input`] messages: a
-//! parsed file from the scanner, lines from the tail, the end of the scan,
-//! and a shutdown request. Live lines merge into the stamps but leave the
-//! file's index entry alone: its stat no longer matches, so the next start
-//! reparses the file, which the max-merge makes harmless. The tail stamps
-//! its lines with a [`LiveClock`], which carries the fold rule's previous
-//! line across batches of the same day file.
+//! parsed file from the scanner, lines from the tail, ZNC session events,
+//! the end of the scan, and a shutdown request. Live lines merge into the
+//! stamps but leave the file's index entry alone: its stat no longer
+//! matches, so the next start reparses the file, which the max-merge makes
+//! harmless. The tail stamps its lines with a [`LiveClock`], which carries
+//! the fold rule's previous line across batches of the same day file.
+//!
+//! # Live snapshots and the session race
+//!
+//! The actor also owns each channel's [`LiveChannel`], never persisted. A
+//! ZNC session is numbered by an epoch and reported as [`SessionEvent`]s.
+//! From its start, lines for a channel whose burst has not arrived yet are
+//! queued as well as applied to the old snapshot; the burst replaces the
+//! snapshot and the queue is replayed on it, so a quit logged while ZNC was
+//! sending the 353 cannot bring the quitter back. Replay is safe because
+//! every delta is idempotent (see live.rs). A burst from an epoch that is
+//! not the current session's is dropped. When the session ends, snapshots
+//! it did not replace go stale, and every one when it failed.
+//!
 //! Readers see an `ArcSwap` snapshot of `Arc<ChannelPresence>` per channel,
 //! republished at most once per second for the channels that changed, and an
 //! atomic scanning flag stored after the final republish. No lock guards the
@@ -84,6 +98,7 @@ use serde::{Deserialize, Serialize};
 use serde_saphyr::{Budget, SerializerOptions};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::live::LiveChannel;
 use crate::parser::{LineKind, LogFormat, LogLine, Time, parse_line};
 use crate::server::read_log_file;
 use crate::{ChannelDir, ChannelNode, yaml_options};
@@ -254,7 +269,7 @@ impl ChannelPresence {
 }
 
 /// rfc1459 casemapping: ASCII lowercase, with `[]\~` as the upper case of `{}|^`.
-fn casemap(nick: &str) -> String {
+pub fn casemap(nick: &str) -> String {
     nick.chars()
         .map(|c| match c {
             '[' => '{',
@@ -332,14 +347,14 @@ pub struct LiveClock {
 }
 
 impl LiveClock {
-    /// What `lines`, read in order from the day file `path`, contribute.
-    /// `None` when the file's name is not a `YYYY-MM-DD` date.
-    pub fn stamps<'l>(
+    /// `lines`, read in order from the day file `path`, with their UTC
+    /// stamps. `None` when the file's name is not a `YYYY-MM-DD` date.
+    pub fn stamp<'l>(
         &mut self,
         path: &Path,
         format: LogFormat,
         lines: impl IntoIterator<Item = &'l LogLine>,
-    ) -> Option<ChannelPresence> {
+    ) -> Option<Vec<(Timestamp, LineKind)>> {
         let dir = path.parent()?;
         let tz = match format {
             LogFormat::Znc => self
@@ -357,11 +372,15 @@ impl LiveClock {
         let clock = slot
             .1
             .as_mut()?;
-        let mut stamps = ChannelPresence::default();
+        let mut stamped = Vec::new();
         let mut skipped = 0usize;
         for line in lines {
             match clock.stamp(line.time) {
-                Some(at) => stamps.apply(at, &line.kind),
+                Some(at) => stamped.push((
+                    at,
+                    line.kind
+                        .clone(),
+                )),
                 None => skipped += 1,
             }
         }
@@ -371,7 +390,7 @@ impl LiveClock {
                 path.display()
             );
         }
-        Some(stamps)
+        Some(stamped)
     }
 }
 
@@ -418,6 +437,25 @@ fn file_stat(path: &Path) -> io::Result<FileStat> {
     })
 }
 
+/// What the ZNC session reports to presence, in order.
+#[derive(Debug)]
+pub enum SessionEvent {
+    /// Session `epoch` is about to connect: lines read from now on are
+    /// queued per channel until that channel's burst.
+    Started { epoch: u64 },
+    /// One channel's burst from session `epoch`.
+    Burst {
+        epoch: u64,
+        channel: String,
+        live: Box<LiveChannel>,
+    },
+    /// Session `epoch` is over. A snapshot it did not replace goes stale,
+    /// every snapshot when it failed.
+    Ended { epoch: u64, ok: bool },
+    /// The bouncer reconnected to IRC: every snapshot is stale until the next session.
+    Stale,
+}
+
 /// Messages the actor acts on, in arrival order.
 enum Input {
     /// A day file the scanner parsed, with what it contributes.
@@ -431,8 +469,10 @@ enum Input {
     /// index entry is left alone, so the next start reparses it.
     Lines {
         channel: String,
-        stamps: ChannelPresence,
+        lines: Vec<(Timestamp, LineKind)>,
     },
+    /// Progress of the ZNC session.
+    Session(SessionEvent),
     /// The scan is over: an index entry neither in `seen` nor under an
     /// `unlisted` directory is for a file that no longer exists.
     ScanFinished {
@@ -944,6 +984,7 @@ fn scan(
 /// What request handlers read: the published stamps and the scanning flag.
 pub struct Presence {
     channels: ArcSwap<HashMap<String, Arc<ChannelPresence>>>,
+    live: ArcSwap<HashMap<String, Arc<LiveChannel>>>,
     scanning: AtomicBool,
     inbox: mpsc::Sender<Input>,
     log_tz: TimeZone,
@@ -960,14 +1001,35 @@ impl Presence {
         }
     }
 
-    /// Merges `stamps`, read live from the channel keyed `channel`. Blocks
-    /// while the actor's inbox is full; call it from a blocking thread.
-    pub fn feed(&self, channel: String, stamps: ChannelPresence) {
+    /// Applies `lines`, read live from the channel keyed `channel`, to its
+    /// stamps and live snapshot. Blocks while the actor's inbox is full;
+    /// call it from a blocking thread.
+    pub fn feed(&self, channel: String, lines: Vec<(Timestamp, LineKind)>) {
         // Fails only once the actor has stopped at shutdown. The file's stat
         // has changed since its index entry, so the next start reparses it.
         let _ = self
             .inbox
-            .blocking_send(Input::Lines { channel, stamps });
+            .blocking_send(Input::Lines { channel, lines });
+    }
+
+    /// Hands the actor one step of a ZNC session.
+    pub async fn session(&self, event: SessionEvent) {
+        if self
+            .inbox
+            .send(Input::Session(event))
+            .await
+            .is_err()
+        {
+            eprintln!("presence: the actor stopped, dropping a ZNC session event");
+        }
+    }
+
+    /// The last published live snapshot of the channel keyed `key`.
+    pub fn live(&self, key: &str) -> Option<Arc<LiveChannel>> {
+        self.live
+            .load()
+            .get(key)
+            .cloned()
     }
 
     /// Whether the startup scan is still running. Read it before
@@ -1013,6 +1075,7 @@ pub fn start(index_path: PathBuf, log_tz: TimeZone, root: &ChannelNode) -> Arc<P
     let (inbox, rx) = mpsc::channel(64);
     let shared = Arc::new(Presence {
         channels: ArcSwap::from_pointee(HashMap::new()),
+        live: ArcSwap::from_pointee(HashMap::new()),
         scanning: AtomicBool::new(true),
         inbox,
         log_tz: log_tz.clone(),
@@ -1059,6 +1122,7 @@ async fn run_actor(
             .cloned()
             .collect(),
         archive,
+        live: LiveState::default(),
         shared,
         index_path,
         unsaved: false,
@@ -1087,8 +1151,121 @@ async fn run_actor(
         .await;
 }
 
+/// Live snapshots per channel and the session in progress, if any.
+#[derive(Debug, Default)]
+struct LiveState {
+    channels: HashMap<String, Arc<LiveChannel>>,
+    session: Option<PendingSession>,
+    /// Channels changed since the last publish.
+    dirty: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct PendingSession {
+    epoch: u64,
+    /// Channels whose burst already replaced their snapshot.
+    bursted: HashSet<String>,
+    /// Lines read since the session started, for channels not yet bursted.
+    queued: HashMap<String, Vec<(Timestamp, LineKind)>>,
+}
+
+impl LiveState {
+    fn lines(&mut self, channel: &str, lines: Vec<(Timestamp, LineKind)>) {
+        if let Some(live) = self
+            .channels
+            .get_mut(channel)
+        {
+            let live = Arc::make_mut(live);
+            for (at, kind) in &lines {
+                live.apply(*at, kind);
+            }
+            self.dirty
+                .insert(channel.to_owned());
+        }
+        // The burst may predate or postdate these lines; replaying them on it is idempotent.
+        if let Some(session) = &mut self.session {
+            if !session
+                .bursted
+                .contains(channel)
+            {
+                session
+                    .queued
+                    .entry(channel.to_owned())
+                    .or_default()
+                    .extend(lines);
+            }
+        }
+    }
+
+    fn session(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::Started { epoch } => {
+                self.session = Some(PendingSession {
+                    epoch,
+                    bursted: HashSet::new(),
+                    queued: HashMap::new(),
+                });
+            }
+            SessionEvent::Burst {
+                epoch,
+                channel,
+                mut live,
+            } => {
+                let Some(session) = self
+                    .session
+                    .as_mut()
+                    .filter(|s| s.epoch == epoch)
+                else {
+                    eprintln!(
+                        "presence: dropping a burst of {channel} from ended ZNC session {epoch}"
+                    );
+                    return;
+                };
+                for (at, kind) in session
+                    .queued
+                    .remove(&channel)
+                    .unwrap_or_default()
+                {
+                    live.apply(at, &kind);
+                }
+                session
+                    .bursted
+                    .insert(channel.clone());
+                self.channels
+                    .insert(channel.clone(), Arc::from(live));
+                self.dirty
+                    .insert(channel);
+            }
+            SessionEvent::Ended { epoch, ok } => {
+                let Some(session) = self
+                    .session
+                    .take_if(|s| s.epoch == epoch)
+                else {
+                    eprintln!("presence: end of ZNC session {epoch}, which is not the current one");
+                    return;
+                };
+                let keep = if ok { session.bursted } else { HashSet::new() };
+                self.mark_stale(|key| !keep.contains(key));
+            }
+            SessionEvent::Stale => self.mark_stale(|_| true),
+        }
+    }
+
+    fn mark_stale(&mut self, which: impl Fn(&str) -> bool) {
+        for (key, live) in &mut self.channels {
+            if live.stale || !which(key) {
+                continue;
+            }
+            Arc::make_mut(live).stale = true;
+            self.dirty
+                .insert(key.clone());
+        }
+    }
+}
+
 struct Actor {
     archive: Archive,
+    live: LiveState,
     shared: Arc<Presence>,
     index_path: PathBuf,
     /// Channels changed since the last publish.
@@ -1135,17 +1312,25 @@ impl Actor {
                     .absorb_file(channel, path, stat, &stamps);
                 self.unsaved = true;
             }
-            Input::Lines { channel, stamps } => {
+            Input::Lines { channel, lines } => {
                 let state = self
                     .archive
                     .channels
                     .entry(channel.clone())
                     .or_default();
-                Arc::make_mut(&mut state.presence).merge(&stamps);
+                let stamps = Arc::make_mut(&mut state.presence);
+                for (at, kind) in &lines {
+                    stamps.apply(*at, kind);
+                }
+                self.live
+                    .lines(&channel, lines);
                 self.dirty
                     .insert(channel);
                 self.unsaved = true;
             }
+            Input::Session(event) => self
+                .live
+                .session(event),
             Input::ScanFinished { seen, unlisted } => {
                 if self
                     .archive
@@ -1174,6 +1359,7 @@ impl Actor {
     }
 
     fn publish(&mut self) {
+        self.publish_live();
         if self
             .dirty
             .is_empty()
@@ -1200,6 +1386,38 @@ impl Actor {
         }
         self.shared
             .channels
+            .store(Arc::new(channels));
+    }
+
+    fn publish_live(&mut self) {
+        if self
+            .live
+            .dirty
+            .is_empty()
+        {
+            return;
+        }
+        let mut channels = HashMap::clone(
+            &self
+                .shared
+                .live
+                .load(),
+        );
+        for key in self
+            .live
+            .dirty
+            .drain()
+        {
+            if let Some(live) = self
+                .live
+                .channels
+                .get(&key)
+            {
+                channels.insert(key, Arc::clone(live));
+            }
+        }
+        self.shared
+            .live
             .store(Arc::new(channels));
     }
 
@@ -1231,44 +1449,101 @@ impl Actor {
 #[derive(Serialize)]
 struct PresenceJson<'a> {
     scanning: bool,
-    topic: Option<&'a Topic>,
-    users: BTreeMap<&'a str, UserJson>,
+    snapshot_at: Option<Timestamp>,
+    stale: bool,
+    topic: Option<TopicJson<'a>>,
+    users: BTreeMap<&'a str, UserJson<'a>>,
 }
 
 #[derive(Serialize)]
-struct UserJson {
+struct TopicJson<'a> {
+    source: &'static str,
+    #[serde(flatten)]
+    topic: &'a Topic,
+}
+
+#[derive(Serialize)]
+struct UserJson<'a> {
+    /// In the channel now; `None` without a snapshot.
+    live: Option<bool>,
+    prefixes: &'a str,
     online: Option<Timestamp>,
     offline: Option<Timestamp>,
     spoke: Option<Timestamp>,
 }
 
-/// The presence endpoint's JSON body for one channel.
-pub fn json_body(scanning: bool, channel: Option<&ChannelPresence>) -> serde_json::Result<String> {
-    let users = channel
+/// The presence endpoint's JSON body for one channel: archive stamps for
+/// every nick in either source, live status when a snapshot exists, and the
+/// live topic when known, else the archive's.
+pub fn json_body(
+    scanning: bool,
+    archive: Option<&ChannelPresence>,
+    live: Option<&LiveChannel>,
+) -> serde_json::Result<String> {
+    let mut users: HashMap<&str, (&str, UserJson)> = HashMap::new();
+    for (key, user) in archive
         .into_iter()
-        .flat_map(|c| {
-            c.users
-                .values()
-        })
-        .map(|user| {
+        .flat_map(|c| &c.users)
+    {
+        let member = live.and_then(|l| {
+            l.members
+                .get(key)
+        });
+        users.insert(
+            key,
             (
-                user.nick
-                    .as_str(),
+                member.map_or(&user.nick, |m| &m.nick),
                 UserJson {
+                    live: live.map(|_| member.is_some()),
+                    prefixes: member.map_or("", |m| &m.prefixes),
                     online: user.online,
                     offline: user.offline,
                     spoke: user.spoke,
                 },
-            )
-        })
-        .collect();
+            ),
+        );
+    }
+    for (key, member) in live
+        .into_iter()
+        .flat_map(|l| &l.members)
+    {
+        users
+            .entry(key)
+            .or_insert((
+                &member.nick,
+                UserJson {
+                    live: Some(true),
+                    prefixes: &member.prefixes,
+                    online: None,
+                    offline: None,
+                    spoke: None,
+                },
+            ));
+    }
+    let live_topic = live.and_then(|l| {
+        l.topic
+            .as_ref()
+            .map(|topic| TopicJson {
+                source: "live",
+                topic,
+            })
+    });
+    let archive_topic = archive.and_then(|c| {
+        c.topic
+            .as_ref()
+            .map(|topic| TopicJson {
+                source: "archive",
+                topic,
+            })
+    });
     serde_json::to_string(&PresenceJson {
         scanning,
-        topic: channel.and_then(|c| {
-            c.topic
-                .as_ref()
-        }),
-        users,
+        snapshot_at: live.map(|l| l.snapshot_at),
+        stale: live.is_some_and(|l| l.stale),
+        topic: live_topic.or(archive_topic),
+        users: users
+            .into_values()
+            .collect(),
     })
 }
 
@@ -1282,6 +1557,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::live::ModeSpec;
     use crate::resolve_log_timezone;
     use crate::test_support::{add_channel, app, app_state, tempdir};
 
@@ -1354,7 +1630,7 @@ mod tests {
                 Input::ScanFinished { seen, unlisted } => {
                     archive.drop_gone(&seen, &unlisted);
                 }
-                Input::Lines { .. } | Input::Shutdown(_) => {
+                Input::Lines { .. } | Input::Session(_) | Input::Shutdown(_) => {
                     unreachable!("the scanner sends only File and ScanFinished")
                 }
             }
@@ -1639,42 +1915,33 @@ mod tests {
         let (inbox, _rx) = mpsc::channel(1);
         let presence = Presence {
             channels: ArcSwap::from_pointee(HashMap::new()),
+            live: ArcSwap::from_pointee(HashMap::new()),
             scanning: AtomicBool::new(false),
             inbox,
             log_tz: tz,
         };
         let mut clock = presence.live_clock();
-        let line = |h, m, nick: &str| LogLine {
+        let line = |h, m| LogLine {
             time: hms(h, m, 0),
-            kind: says(nick),
+            kind: says("a"),
         };
-        let spoke = |stamps: Option<ChannelPresence>, nick: &str| {
-            stamps
-                .unwrap()
-                .users[nick]
-                .spoke
-                .unwrap()
-        };
+        let at = |stamped: Option<Vec<(Timestamp, LineKind)>>| stamped.unwrap()[0].0;
         let fold_day = Path::new("/l/#c/2026-11-01.log");
-        let first = clock.stamps(fold_day, LogFormat::Znc, &[line(1, 50, "a")]);
-        assert_eq!(spoke(first, "a"), ts("2026-11-01T05:50:00Z"));
+        let first = clock.stamp(fold_day, LogFormat::Znc, &[line(1, 50)]);
+        assert_eq!(at(first), ts("2026-11-01T05:50:00Z"));
         // The previous batch's 01:50 EDT puts this 01:10 in EST.
-        let second = clock.stamps(fold_day, LogFormat::Znc, &[line(1, 10, "b")]);
-        assert_eq!(spoke(second, "b"), ts("2026-11-01T06:10:00Z"));
+        let second = clock.stamp(fold_day, LogFormat::Znc, &[line(1, 10)]);
+        assert_eq!(at(second), ts("2026-11-01T06:10:00Z"));
 
         let next_day = Path::new("/l/#c/2026-11-02.log");
-        let third = clock.stamps(next_day, LogFormat::Znc, &[line(0, 5, "c")]);
-        assert_eq!(spoke(third, "c"), ts("2026-11-02T05:05:00Z"));
+        let third = clock.stamp(next_day, LogFormat::Znc, &[line(0, 5)]);
+        assert_eq!(at(third), ts("2026-11-02T05:05:00Z"));
         let iso = Path::new("/l/#i/2026-11-02.log");
-        let fourth = clock.stamps(iso, LogFormat::Iso8601, &[line(0, 5, "d")]);
-        assert_eq!(spoke(fourth, "d"), ts("2026-11-02T00:05:00Z"));
+        let fourth = clock.stamp(iso, LogFormat::Iso8601, &[line(0, 5)]);
+        assert_eq!(at(fourth), ts("2026-11-02T00:05:00Z"));
 
         assert_eq!(
-            clock.stamps(
-                Path::new("/l/#c/today.log"),
-                LogFormat::Znc,
-                &[line(0, 0, "e")]
-            ),
+            clock.stamp(Path::new("/l/#c/today.log"), LogFormat::Znc, &[line(0, 0)]),
             None
         );
     }
@@ -1905,10 +2172,12 @@ mod tests {
             body,
             serde_json::json!({
                 "scanning": false,
-                "topic": {"nick": "op", "text": "hello", "at": "2026-01-01T10:01:00Z"},
+                "snapshot_at": null,
+                "stale": false,
+                "topic": {"source": "archive", "nick": "op", "text": "hello", "at": "2026-01-01T10:01:00Z"},
                 "users": {
-                    "Foo": {"online": "2026-01-01T10:00:05Z", "offline": null, "spoke": "2026-01-01T10:00:05Z"},
-                    "bar": {"online": null, "offline": "2026-01-01T10:02:00Z", "spoke": null},
+                    "Foo": {"live": null, "prefixes": "", "online": "2026-01-01T10:00:05Z", "offline": null, "spoke": "2026-01-01T10:00:05Z"},
+                    "bar": {"live": null, "prefixes": "", "online": null, "offline": "2026-01-01T10:02:00Z", "spoke": null},
                 },
             })
         );
@@ -1983,6 +2252,147 @@ mod tests {
         presence
             .shutdown()
             .await;
+    }
+
+    fn burst(epoch: u64, names: &[&str]) -> SessionEvent {
+        SessionEvent::Burst {
+            epoch,
+            channel: "#c".into(),
+            live: Box::new(LiveChannel::from_burst(
+                names
+                    .iter()
+                    .copied(),
+                None,
+                ts("2026-01-01T00:00:00Z"),
+                ModeSpec::default(),
+            )),
+        }
+    }
+
+    fn members(live: &LiveState, key: &str) -> Vec<String> {
+        let mut nicks: Vec<String> = live.channels[key]
+            .members
+            .values()
+            .map(|m| {
+                m.nick
+                    .clone()
+            })
+            .collect();
+        nicks.sort();
+        nicks
+    }
+
+    #[test]
+    fn a_line_read_before_its_channels_burst_is_replayed_on_it() {
+        let at = ts("2026-01-01T00:00:01Z");
+        let mut live = LiveState::default();
+        live.session(SessionEvent::Started { epoch: 1 });
+        // The quit is logged while ZNC is still sending the burst, which lists alice.
+        live.lines("#c", vec![(at, quits("alice"))]);
+        live.session(burst(1, &["alice", "bob"]));
+        assert_eq!(members(&live, "#c"), ["bob"]);
+
+        // After its burst, a channel's lines apply directly and are not queued.
+        live.lines("#c", vec![(at, join("carol"))]);
+        assert_eq!(members(&live, "#c"), ["bob", "carol"]);
+        assert!(
+            live.session
+                .as_ref()
+                .unwrap()
+                .queued
+                .is_empty()
+        );
+        live.session(SessionEvent::Ended { epoch: 1, ok: true });
+        assert!(!live.channels["#c"].stale);
+    }
+
+    #[test]
+    fn snapshots_a_session_did_not_replace_go_stale() {
+        let mut live = LiveState::default();
+        live.session(SessionEvent::Started { epoch: 1 });
+        live.session(burst(1, &["a"]));
+        live.session(SessionEvent::Ended { epoch: 1, ok: true });
+        assert!(!live.channels["#c"].stale);
+
+        // A session with no JOIN for #c leaves its old snapshot, stale.
+        live.session(SessionEvent::Started { epoch: 2 });
+        live.session(SessionEvent::Ended { epoch: 2, ok: true });
+        assert!(live.channels["#c"].stale);
+
+        // A failed session stales even the channels it did burst.
+        live.session(SessionEvent::Started { epoch: 3 });
+        live.session(burst(3, &["b"]));
+        assert!(!live.channels["#c"].stale);
+        live.session(SessionEvent::Ended {
+            epoch: 3,
+            ok: false,
+        });
+        assert!(live.channels["#c"].stale);
+        assert_eq!(members(&live, "#c"), ["b"]);
+
+        // A burst from a session that is over changes nothing.
+        live.session(burst(3, &["late"]));
+        assert_eq!(members(&live, "#c"), ["b"]);
+
+        live.session(SessionEvent::Started { epoch: 4 });
+        live.session(burst(4, &["c"]));
+        live.session(SessionEvent::Ended { epoch: 4, ok: true });
+        live.session(SessionEvent::Stale);
+        assert!(live.channels["#c"].stale);
+    }
+
+    #[test]
+    fn json_joins_archive_and_live_users() {
+        let archive = file_stamps(&[
+            ("2026-01-01T00:00:01Z", says("Alice")),
+            ("2026-01-01T00:00:02Z", quits("gone")),
+            ("2026-01-01T00:00:03Z", topic("op", "archived")),
+        ]);
+        let mut snapshot = LiveChannel::from_burst(
+            ["@alice", "+new"],
+            None,
+            ts("2026-01-01T01:00:00Z"),
+            ModeSpec::default(),
+        );
+        let body = |live: Option<&LiveChannel>| {
+            serde_json::from_str::<serde_json::Value>(
+                &json_body(false, Some(&archive), live).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            body(None),
+            serde_json::json!({
+                "scanning": false,
+                "snapshot_at": null,
+                "stale": false,
+                "topic": {"source": "archive", "nick": "op", "text": "archived", "at": "2026-01-01T00:00:03Z"},
+                "users": {
+                    "Alice": {"live": null, "prefixes": "", "online": "2026-01-01T00:00:01Z", "offline": null, "spoke": "2026-01-01T00:00:01Z"},
+                    "gone": {"live": null, "prefixes": "", "online": null, "offline": "2026-01-01T00:00:02Z", "spoke": null},
+                },
+            })
+        );
+        snapshot.topic = Some(Topic {
+            nick: "op2".into(),
+            text: "live".into(),
+            at: ts("2026-01-01T00:30:00Z"),
+        });
+        snapshot.stale = true;
+        assert_eq!(
+            body(Some(&snapshot)),
+            serde_json::json!({
+                "scanning": false,
+                "snapshot_at": "2026-01-01T01:00:00Z",
+                "stale": true,
+                "topic": {"source": "live", "nick": "op2", "text": "live", "at": "2026-01-01T00:30:00Z"},
+                "users": {
+                    "alice": {"live": true, "prefixes": "@", "online": "2026-01-01T00:00:01Z", "offline": null, "spoke": "2026-01-01T00:00:01Z"},
+                    "gone": {"live": false, "prefixes": "", "online": null, "offline": "2026-01-01T00:00:02Z", "spoke": null},
+                    "new": {"live": true, "prefixes": "+", "online": null, "offline": null, "spoke": null},
+                },
+            })
+        );
     }
 
     #[tokio::test]

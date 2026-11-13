@@ -22,6 +22,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
 use crate::limits;
+use crate::live::LiveChannel;
 use crate::parser::{LogFormat, parse_line};
 use crate::presence::{ChannelPresence, json_body};
 use crate::search::search_channel;
@@ -537,11 +538,11 @@ async fn serve_presence(
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
     let scanning = presence.scanning();
-    let snapshot = presence.channel(
-        &channel
-            .path_segments
-            .join("/"),
-    );
+    let key = channel
+        .path_segments
+        .join("/");
+    let snapshot = presence.channel(&key);
+    let live = presence.live(&key);
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| {
@@ -556,8 +557,14 @@ async fn serve_presence(
                 .len()
                 > PRESENCE_INLINE_USERS
         });
-    let respond =
-        move || presence_response(scanning, snapshot.as_deref(), if_none_match.as_deref());
+    let respond = move || {
+        presence_response(
+            scanning,
+            snapshot.as_deref(),
+            live.as_deref(),
+            if_none_match.as_deref(),
+        )
+    };
     if large {
         off_runtime(respond).await
     } else {
@@ -568,9 +575,10 @@ async fn serve_presence(
 fn presence_response(
     scanning: bool,
     channel: Option<&ChannelPresence>,
+    live: Option<&LiveChannel>,
     if_none_match: Option<&str>,
 ) -> Response {
-    let body = match json_body(scanning, channel) {
+    let body = match json_body(scanning, channel, live) {
         Ok(body) => body,
         Err(e) => {
             eprintln!("presence: cannot serialize the JSON body: {e}");

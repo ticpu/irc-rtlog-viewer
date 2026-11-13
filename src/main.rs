@@ -20,6 +20,7 @@ use tokio::sync::{RwLock, Semaphore};
 
 mod ai;
 mod limits;
+mod live;
 mod parser;
 mod presence;
 mod search;

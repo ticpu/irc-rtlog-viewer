@@ -83,8 +83,8 @@ fn tail_loop(
             }
 
             if let Some((presence, clock)) = live.as_mut() {
-                if let Some(stamps) = clock.stamps(path, format, &parsed) {
-                    presence.feed(channel_key.clone(), stamps);
+                if let Some(stamped) = clock.stamp(path, format, &parsed) {
+                    presence.feed(channel_key.clone(), stamped);
                 }
             }
 
