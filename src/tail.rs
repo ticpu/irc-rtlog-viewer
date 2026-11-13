@@ -1,16 +1,27 @@
-use std::collections::HashMap;
+//! Streams lines appended to channel logs to SSE viewers and to presence.
+//!
+//! Each batch of new lines is parsed once and fed to presence before the
+//! SSE sender lookup, so stamps advance with no viewer subscribed.
+//!
+//! Offsets start at every file's current end, ZNC `status/` files beside
+//! the channel directories included: lines already on disk reach viewers
+//! with the page and presence through its scan, and a "Connected to IRC"
+//! line from before the start is never read as a new one.
+
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::parser::{LogFormat, parse_line};
+use crate::parser::{LogFormat, LogLine, parse_line};
+use crate::presence::{LiveClock, Presence};
 use crate::templates::render_line;
 use crate::{AppState, ChannelNode};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
-/// Streams lines appended to channel logs until the returned watcher is dropped,
-/// which closes its event channel and ends the tail thread.
+/// Tails the logs until the returned watcher is dropped, which closes its
+/// event channel and ends the tail thread.
 pub fn start_watcher(state: Arc<AppState>) -> notify::RecommendedWatcher {
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
 
@@ -24,13 +35,18 @@ pub fn start_watcher(state: Arc<AppState>) -> notify::RecommendedWatcher {
     // Taken after the watch starts, so a line appended in between is either
     // already counted here or reported by a queued event.
     let mut offsets = Offsets::at_current_ends(&state.channels);
-    tokio::task::spawn_blocking(move || tail_loop(rx, &mut offsets, &state));
+    let live = state
+        .presence
+        .as_ref()
+        .map(|p| (Arc::clone(p), p.live_clock()));
+    tokio::task::spawn_blocking(move || tail_loop(rx, &mut offsets, live, &state));
     watcher
 }
 
 fn tail_loop(
     rx: std::sync::mpsc::Receiver<notify::Result<Event>>,
     offsets: &mut Offsets,
+    mut live: Option<(Arc<Presence>, LiveClock)>,
     state: &AppState,
 ) {
     for event in rx {
@@ -58,8 +74,18 @@ fn tail_loop(
                     continue;
                 }
             };
-            if new_lines.is_empty() {
+            let parsed: Vec<LogLine> = new_lines
+                .lines()
+                .filter_map(|line| parse_line(line, format))
+                .collect();
+            if parsed.is_empty() {
                 continue;
+            }
+
+            if let Some((presence, clock)) = live.as_mut() {
+                if let Some(stamps) = clock.stamps(path, format, &parsed) {
+                    presence.feed(channel_key.clone(), stamps);
+                }
             }
 
             let senders = state
@@ -68,15 +94,9 @@ fn tail_loop(
             let Some(sender) = senders.get(&channel_key) else {
                 continue;
             };
-
-            for raw_line in new_lines.lines() {
-                if raw_line.is_empty() {
-                    continue;
-                }
-                if let Some(parsed) = parse_line(raw_line, format) {
-                    let html = render_line(&parsed).into_string();
-                    let _ = sender.send(html);
-                }
+            for line in &parsed {
+                // An error only means no viewer is subscribed right now.
+                let _ = sender.send(render_line(line).into_string());
             }
         }
     }
@@ -86,10 +106,11 @@ fn tail_loop(
 struct Offsets(HashMap<PathBuf, u64>);
 
 impl Offsets {
-    /// Every existing `.log` at its current end: what is already on disk
-    /// reaches viewers with the page, not through the stream.
+    /// Every existing `.log` of the channel directories and of the ZNC
+    /// `status/` directories beside them, at its current end.
     fn at_current_ends(channels: &ChannelNode) -> Self {
-        let mut offsets = HashMap::new();
+        let mut offsets = Self(HashMap::new());
+        let mut status_dirs = HashSet::new();
         let mut stack = vec![channels];
         while let Some(node) = stack.pop() {
             stack.extend(
@@ -100,29 +121,48 @@ impl Offsets {
                 continue;
             };
             for dir in &channel.dirs {
-                let entries = match std::fs::read_dir(&dir.path) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        eprintln!(
-                            "tail: cannot list {}: {e}",
-                            dir.path
-                                .display()
-                        );
-                        continue;
-                    }
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension() != Some("log".as_ref()) {
-                        continue;
-                    }
-                    if let Ok(meta) = entry.metadata() {
-                        offsets.insert(path, meta.len());
-                    }
+                offsets.seed_dir(&dir.path);
+                if dir.format != LogFormat::Znc {
+                    continue;
+                }
+                if let Some(network) = dir
+                    .path
+                    .parent()
+                {
+                    status_dirs.insert(network.join("status"));
                 }
             }
         }
-        Self(offsets)
+        for dir in status_dirs {
+            // A network whose status window was never logged has no such directory.
+            if dir.is_dir() {
+                offsets.seed_dir(&dir);
+            }
+        }
+        offsets
+    }
+
+    fn seed_dir(&mut self, dir: &Path) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("tail: cannot list {}: {e}", dir.display());
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension() != Some("log".as_ref()) {
+                continue;
+            }
+            match entry.metadata() {
+                Ok(meta) => {
+                    self.0
+                        .insert(path, meta.len());
+                }
+                Err(e) => eprintln!("tail: cannot stat {}: {e}", path.display()),
+            }
+        }
     }
 
     /// Complete lines appended since the last call. A trailing partial line
@@ -305,5 +345,100 @@ mod tests {
             "more than the appended line was streamed"
         );
         drop(watcher);
+    }
+
+    /// `net/#c` under `root`, in ZNC format, with one day file holding `day`.
+    fn znc_channel(root: &Path, day: &str) -> (ChannelNode, PathBuf) {
+        let dir = root.join("net/#c");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("2026-01-01.log");
+        std::fs::write(&log, day).unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: dir,
+            format: LogFormat::Znc,
+        }];
+        add_channel(&mut channels, &["net", "#c"], dirs);
+        (channels, log)
+    }
+
+    #[test]
+    fn status_lines_on_disk_at_start_are_not_read_as_new() {
+        let root = tempdir();
+        let (channels, _) = znc_channel(root.path(), "[00:00:00] <a> hi\n");
+        let status = root
+            .path()
+            .join("net/status");
+        std::fs::create_dir(&status).unwrap();
+        let log = status.join("2026-01-01.log");
+        std::fs::write(&log, "[00:00:01] Connected to IRC (irc.example.org)\n").unwrap();
+
+        let mut offsets = Offsets::at_current_ends(&channels);
+        assert_eq!(
+            offsets
+                .new_lines(&log)
+                .unwrap(),
+            ""
+        );
+        append(&log, b"[00:05:00] Connected to IRC (irc.example.org)\n");
+        assert_eq!(
+            offsets
+                .new_lines(&log)
+                .unwrap(),
+            "[00:05:00] Connected to IRC (irc.example.org)\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn appended_quit_reaches_presence_with_no_viewer_subscribed() {
+        let root = tempdir();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let day = "[10:00:00] *** Joins: alice (~a@h)\n";
+        let (scanned, log) = znc_channel(&root_path, day);
+        let presence = crate::presence::start(
+            root_path.join("presence.yaml"),
+            jiff::tz::TimeZone::UTC,
+            &scanned,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while presence.scanning() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scan not done within 5 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (channels, _) = znc_channel(&root_path, day);
+        let mut state = app_state(channels, "logs_dirs: []");
+        state.logs_dirs = vec![root_path.clone()];
+        state.presence = Some(Arc::clone(&presence));
+        let watcher = start_watcher(Arc::new(state));
+
+        append(&log, b"[10:00:05] *** Quits: alice (~a@h) (bye)\n");
+        let want: jiff::Timestamp = "2026-01-01T10:00:05Z"
+            .parse()
+            .unwrap();
+        loop {
+            let offline = presence
+                .channel("net/#c")
+                .and_then(|c| {
+                    c.users
+                        .get("alice")
+                        .and_then(|u| u.offline)
+                });
+            if offline == Some(want) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline + Duration::from_secs(5),
+                "the quit did not reach presence within 5 s: {offline:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(watcher);
+        presence
+            .shutdown()
+            .await;
     }
 }

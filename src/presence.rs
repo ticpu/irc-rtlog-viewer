@@ -40,7 +40,12 @@
 //! # Ownership
 //!
 //! One actor task owns the mutable state and takes [`Input`] messages: a
-//! parsed file from the scanner, the end of the scan, and a shutdown request.
+//! parsed file from the scanner, lines from the tail, the end of the scan,
+//! and a shutdown request. Live lines merge into the stamps but leave the
+//! file's index entry alone: its stat no longer matches, so the next start
+//! reparses the file, which the max-merge makes harmless. The tail stamps
+//! its lines with a [`LiveClock`], which carries the fold rule's previous
+//! line across batches of the same day file.
 //! Readers see an `ArcSwap` snapshot of `Arc<ChannelPresence>` per channel,
 //! republished at most once per second for the channels that changed, and an
 //! atomic scanning flag stored after the final republish. No lock guards the
@@ -79,7 +84,7 @@ use serde::{Deserialize, Serialize};
 use serde_saphyr::{Budget, SerializerOptions};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::parser::{LineKind, LogFormat, Time, parse_line};
+use crate::parser::{LineKind, LogFormat, LogLine, Time, parse_line};
 use crate::server::read_log_file;
 use crate::{ChannelDir, ChannelNode, yaml_options};
 
@@ -262,14 +267,14 @@ fn casemap(nick: &str) -> String {
 }
 
 /// Turns one day file's `hh:mm:ss` times into UTC stamps, in file order.
-struct DayClock<'a> {
-    tz: &'a TimeZone,
+struct DayClock {
+    tz: TimeZone,
     date: Date,
     prev: Option<Timestamp>,
 }
 
-impl<'a> DayClock<'a> {
-    fn new(tz: &'a TimeZone, date: Date) -> Self {
+impl DayClock {
+    fn new(tz: TimeZone, date: Date) -> Self {
         Self {
             tz,
             date,
@@ -317,6 +322,84 @@ impl<'a> DayClock<'a> {
     }
 }
 
+/// Stamps lines the tail reads, keeping one [`DayClock`] per directory for
+/// its current day file, so the fold rule sees the previous live line.
+pub struct LiveClock {
+    log_tz: TimeZone,
+    /// Per directory: the day file last read and its clock, `None` when its
+    /// name is not a date.
+    by_dir: HashMap<PathBuf, (PathBuf, Option<DayClock>)>,
+}
+
+impl LiveClock {
+    /// What `lines`, read in order from the day file `path`, contribute.
+    /// `None` when the file's name is not a `YYYY-MM-DD` date.
+    pub fn stamps<'l>(
+        &mut self,
+        path: &Path,
+        format: LogFormat,
+        lines: impl IntoIterator<Item = &'l LogLine>,
+    ) -> Option<ChannelPresence> {
+        let dir = path.parent()?;
+        let tz = match format {
+            LogFormat::Znc => self
+                .log_tz
+                .clone(),
+            LogFormat::Iso8601 => TimeZone::UTC,
+        };
+        let slot = self
+            .by_dir
+            .entry(dir.to_owned())
+            .or_insert_with(|| (PathBuf::new(), None));
+        if slot.0 != path {
+            *slot = (path.to_owned(), day_clock(path, tz));
+        }
+        let clock = slot
+            .1
+            .as_mut()?;
+        let mut stamps = ChannelPresence::default();
+        let mut skipped = 0usize;
+        for line in lines {
+            match clock.stamp(line.time) {
+                Some(at) => stamps.apply(at, &line.kind),
+                None => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            eprintln!(
+                "presence: skipped {skipped} unparsable live lines in {}",
+                path.display()
+            );
+        }
+        Some(stamps)
+    }
+}
+
+/// A clock for the day file `path`, or `None`, logged, when its name is not a date.
+fn day_clock(path: &Path, tz: TimeZone) -> Option<DayClock> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    match stem.parse::<Date>() {
+        Ok(date) if stem.len() == 10 => Some(DayClock::new(tz, date)),
+        Ok(_) => {
+            eprintln!(
+                "presence: not stamping live lines of {}: not a YYYY-MM-DD name",
+                path.display()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "presence: not stamping live lines of {}: not a date: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// What the index compares to decide whether a file needs reparsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileStat {
@@ -342,6 +425,12 @@ enum Input {
         channel: String,
         path: PathBuf,
         stat: FileStat,
+        stamps: ChannelPresence,
+    },
+    /// Lines the tail read from the channel's current day file. The file's
+    /// index entry is left alone, so the next start reparses it.
+    Lines {
+        channel: String,
         stamps: ChannelPresence,
     },
     /// The scan is over: an index entry neither in `seen` nor under an
@@ -748,7 +837,7 @@ fn parse_day_file(
     date: Date,
 ) -> io::Result<ChannelPresence> {
     let content = read_log_file(path)?;
-    let mut clock = DayClock::new(tz, date);
+    let mut clock = DayClock::new(tz.clone(), date);
     let mut stamps = ChannelPresence::default();
     let mut skipped = 0usize;
     for line in content.lines() {
@@ -857,9 +946,30 @@ pub struct Presence {
     channels: ArcSwap<HashMap<String, Arc<ChannelPresence>>>,
     scanning: AtomicBool,
     inbox: mpsc::Sender<Input>,
+    log_tz: TimeZone,
 }
 
 impl Presence {
+    /// A stamper for lines the tail reads, ZNC directories read in `log_timezone`.
+    pub fn live_clock(&self) -> LiveClock {
+        LiveClock {
+            log_tz: self
+                .log_tz
+                .clone(),
+            by_dir: HashMap::new(),
+        }
+    }
+
+    /// Merges `stamps`, read live from the channel keyed `channel`. Blocks
+    /// while the actor's inbox is full; call it from a blocking thread.
+    pub fn feed(&self, channel: String, stamps: ChannelPresence) {
+        // Fails only once the actor has stopped at shutdown. The file's stat
+        // has changed since its index entry, so the next start reparses it.
+        let _ = self
+            .inbox
+            .blocking_send(Input::Lines { channel, stamps });
+    }
+
     /// Whether the startup scan is still running. Read it before
     /// [`Presence::channel`]: once false, the snapshot holds the scan's result.
     pub fn scanning(&self) -> bool {
@@ -905,6 +1015,7 @@ pub fn start(index_path: PathBuf, log_tz: TimeZone, root: &ChannelNode) -> Arc<P
         channels: ArcSwap::from_pointee(HashMap::new()),
         scanning: AtomicBool::new(true),
         inbox,
+        log_tz: log_tz.clone(),
     });
     let channels = scan_channels(root);
     tokio::spawn(run_actor(
@@ -1022,6 +1133,17 @@ impl Actor {
                     .insert(channel.clone());
                 self.archive
                     .absorb_file(channel, path, stat, &stamps);
+                self.unsaved = true;
+            }
+            Input::Lines { channel, stamps } => {
+                let state = self
+                    .archive
+                    .channels
+                    .entry(channel.clone())
+                    .or_default();
+                Arc::make_mut(&mut state.presence).merge(&stamps);
+                self.dirty
+                    .insert(channel);
                 self.unsaved = true;
             }
             Input::ScanFinished { seen, unlisted } => {
@@ -1232,7 +1354,9 @@ mod tests {
                 Input::ScanFinished { seen, unlisted } => {
                     archive.drop_gone(&seen, &unlisted);
                 }
-                Input::Shutdown(_) => unreachable!("the scanner never sends Shutdown"),
+                Input::Lines { .. } | Input::Shutdown(_) => {
+                    unreachable!("the scanner sends only File and ScanFinished")
+                }
             }
         }
         parsed
@@ -1465,7 +1589,7 @@ mod tests {
 
     fn check_dst(tz: &TimeZone) {
         let mut clock = DayClock::new(
-            tz,
+            tz.clone(),
             "2026-11-01"
                 .parse()
                 .unwrap(),
@@ -1494,7 +1618,7 @@ mod tests {
         assert_eq!(got, expected);
 
         let mut clock = DayClock::new(
-            tz,
+            tz.clone(),
             "2026-03-08"
                 .parse()
                 .unwrap(),
@@ -1507,6 +1631,52 @@ mod tests {
     #[test]
     fn posix_log_timezone_folds_forward_and_shifts_gaps_forward() {
         check_dst(&resolve_log_timezone("EST5EDT,M3.2.0,M11.1.0").unwrap());
+    }
+
+    #[test]
+    fn live_clock_keeps_the_fold_across_batches_and_follows_the_day_file() {
+        let tz = resolve_log_timezone("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        let (inbox, _rx) = mpsc::channel(1);
+        let presence = Presence {
+            channels: ArcSwap::from_pointee(HashMap::new()),
+            scanning: AtomicBool::new(false),
+            inbox,
+            log_tz: tz,
+        };
+        let mut clock = presence.live_clock();
+        let line = |h, m, nick: &str| LogLine {
+            time: hms(h, m, 0),
+            kind: says(nick),
+        };
+        let spoke = |stamps: Option<ChannelPresence>, nick: &str| {
+            stamps
+                .unwrap()
+                .users[nick]
+                .spoke
+                .unwrap()
+        };
+        let fold_day = Path::new("/l/#c/2026-11-01.log");
+        let first = clock.stamps(fold_day, LogFormat::Znc, &[line(1, 50, "a")]);
+        assert_eq!(spoke(first, "a"), ts("2026-11-01T05:50:00Z"));
+        // The previous batch's 01:50 EDT puts this 01:10 in EST.
+        let second = clock.stamps(fold_day, LogFormat::Znc, &[line(1, 10, "b")]);
+        assert_eq!(spoke(second, "b"), ts("2026-11-01T06:10:00Z"));
+
+        let next_day = Path::new("/l/#c/2026-11-02.log");
+        let third = clock.stamps(next_day, LogFormat::Znc, &[line(0, 5, "c")]);
+        assert_eq!(spoke(third, "c"), ts("2026-11-02T05:05:00Z"));
+        let iso = Path::new("/l/#i/2026-11-02.log");
+        let fourth = clock.stamps(iso, LogFormat::Iso8601, &[line(0, 5, "d")]);
+        assert_eq!(spoke(fourth, "d"), ts("2026-11-02T00:05:00Z"));
+
+        assert_eq!(
+            clock.stamps(
+                Path::new("/l/#c/today.log"),
+                LogFormat::Znc,
+                &[line(0, 0, "e")]
+            ),
+            None
+        );
     }
 
     #[test]
