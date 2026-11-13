@@ -29,9 +29,13 @@ fn nick_span(nick: &str) -> Markup {
     }
 }
 
-/// The byte ranges of the `http://` and `https://` URLs in `text`, each
-/// running to the next whitespace. Every link a page shows comes from
-/// here, so the embed check sees exactly the URLs a reader can click.
+/// The byte ranges of the `http://` and `https://` URLs in `text`. A URL
+/// runs to whitespace, `<`, `>` or `"`, then loses trailing sentence
+/// punctuation and any `)` or `]` without an opening match, so
+/// `<https://x/y>` and `(see https://x/y).` give `https://x/y` while
+/// `https://w/Foo_(bar)` keeps its parenthesis. Every link a page shows
+/// comes from here, so the embed check sees exactly the URLs a reader can
+/// click.
 pub fn urls(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut last = 0;
     text.match_indices("http")
@@ -47,15 +51,47 @@ pub fn urls(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
             } else {
                 return None;
             };
-            if scheme_end >= rest.len() {
+            let raw_end = rest[scheme_end..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"'))
+                .map_or(rest.len(), |p| scheme_end + p);
+            let url_end = trim_url_end(&rest[..raw_end]);
+            if url_end <= scheme_end {
                 return None;
             }
-            let url_end = rest[scheme_end..]
-                .find(char::is_whitespace)
-                .map_or(rest.len(), |p| scheme_end + p);
-            last = i + url_end;
-            Some(i..last)
+            last = i + raw_end;
+            Some(i..i + url_end)
         })
+}
+
+/// The length of `url` without trailing punctuation and unbalanced closers.
+fn trim_url_end(url: &str) -> usize {
+    let mut end = url.len();
+    loop {
+        let Some(c) = url[..end]
+            .chars()
+            .next_back()
+        else {
+            return end;
+        };
+        let unbalanced = |open, close| {
+            url[..end]
+                .matches(close)
+                .count()
+                > url[..end]
+                    .matches(open)
+                    .count()
+        };
+        let trim = match c {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
+            ')' => unbalanced('(', ')'),
+            ']' => unbalanced('[', ']'),
+            _ => false,
+        };
+        if !trim {
+            return end;
+        }
+        end -= c.len_utf8();
+    }
 }
 
 /// The part of a line that [`render_line`] passes through [`linkify`].
@@ -518,6 +554,41 @@ mod tests {
         assert!(out.contains(r#"<a href="https://example.com/""#));
         assert!(out.contains("see "));
         assert!(out.contains(" here"));
+    }
+
+    #[test]
+    fn urls_stop_before_brackets_quotes_and_trailing_punctuation() {
+        let cases = [
+            // A Matrix bridge's long-message notice.
+            (
+                "... (full message at <https://bridge.example/media/download/AbC_d-9>)",
+                vec!["https://bridge.example/media/download/AbC_d-9"],
+            ),
+            ("see https://x.org/a.", vec!["https://x.org/a"]),
+            ("(https://x.org/a), and", vec!["https://x.org/a"]),
+            (
+                "https://w.org/Foo_(bar) ok",
+                vec!["https://w.org/Foo_(bar)"],
+            ),
+            ("[https://w.org/a]", vec!["https://w.org/a"]),
+            ("https://w.org/a?q='x'!", vec!["https://w.org/a?q='x"]),
+            ("href=\"https://x.org/q\"", vec!["https://x.org/q"]),
+            (
+                "https://x.org/a%7e,https://y.org/b",
+                vec!["https://x.org/a%7e,https://y.org/b"],
+            ),
+            ("nothing after https://. here", vec![]),
+        ];
+        for (text, want) in cases {
+            let got: Vec<&str> = urls(text)
+                .map(|r| &text[r])
+                .collect();
+            assert_eq!(got, want, "{text}");
+        }
+        assert_eq!(
+            linkify("at <https://x.org/a>)").into_string(),
+            r#"at &lt;<a href="https://x.org/a" target="_blank" rel="noopener">https://x.org/a</a>&gt;)"#
+        );
     }
 
     #[test]
