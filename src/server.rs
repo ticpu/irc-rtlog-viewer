@@ -1,6 +1,7 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::Router;
 use std::net::{IpAddr, SocketAddr};
@@ -27,6 +28,19 @@ use crate::templates;
 
 static CSS: &str = include_str!("../static/style.css");
 static JS: &str = include_str!("../static/app.js");
+
+/// Asset URLs carry a hash of their content: browsers and proxies keep them for
+/// a day or more, and a page must never pair new markup with an old script.
+pub static CSS_URL: LazyLock<String> =
+    LazyLock::new(|| format!("/static/style.css?v={}", content_version(CSS)));
+pub static JS_URL: LazyLock<String> =
+    LazyLock::new(|| format!("/static/app.js?v={}", content_version(JS)));
+
+fn content_version(content: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
 
 /// No inline script or handler anywhere; inline style attributes stay allowed for
 /// the per-nick colours. frame-src and frame-ancestors cover the ask result iframe.
@@ -1132,8 +1146,9 @@ mod tests {
                 .await
                 .unwrap();
             let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains(&format!(r#"href="{}""#, *CSS_URL)), "{uri}");
             if !uri.starts_with("/ask/output/") {
-                assert!(body.contains("/static/app.js"), "{uri}");
+                assert!(body.contains(&format!(r#"src="{}""#, *JS_URL)), "{uri}");
             }
             assert!(!inline.is_match(&body), "{uri}: {body}");
             if csp == LOG_PAGE_CSP {
