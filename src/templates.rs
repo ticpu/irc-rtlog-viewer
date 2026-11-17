@@ -151,8 +151,9 @@ pub struct LineTime<'a> {
 }
 
 /// A line's time link: file time as text and in the anchor, which shared
-/// links depend on; the UTC instant in `data-at` for app.js to show in the
-/// viewer's zone.
+/// links depend on, after the URL of the line's day page so a link copied
+/// from /today stays valid; the UTC instant in `data-at` for app.js to show
+/// in the viewer's zone.
 fn time_link(href: &str, line: &LogLine, time: Option<LineTime>) -> Markup {
     let hms = line
         .time
@@ -164,7 +165,8 @@ fn time_link(href: &str, line: &LogLine, time: Option<LineTime>) -> Markup {
     }
 }
 
-pub fn render_line(line: &LogLine, time: Option<LineTime>) -> Markup {
+/// A line of the day file whose page is at `day_url`.
+pub fn render_line(line: &LogLine, time: Option<LineTime>, day_url: &str) -> Markup {
     let anchor = line
         .time
         .to_anchor();
@@ -176,7 +178,7 @@ pub fn render_line(line: &LogLine, time: Option<LineTime>) -> Markup {
 
     html! {
         div class=(class) id=(&anchor) {
-            (time_link(&format!("#{anchor}"), line, time))
+            (time_link(&format!("{day_url}#{anchor}"), line, time))
             " "
             @match &line.kind {
                 LineKind::Message { nick, text } => {
@@ -321,7 +323,10 @@ pub struct LogPageContext<'a> {
     pub zone: &'a str,
     pub prev_date: Option<&'a str>,
     pub next_date: Option<&'a str>,
+    /// Whether `date` is the channel's newest day file, which the live tail extends.
     pub is_today: bool,
+    /// Served as /today: app.js reloads when the tail reaches a newer day.
+    pub follow: bool,
     pub ai_enabled: bool,
     pub base_path: &'a str,
     pub search_max_len: usize,
@@ -345,6 +350,7 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
     let ai_enabled = ctx.ai_enabled;
     let bp = ctx.base_path;
     let encoded = channel.url_path();
+    let day_url = format!("{bp}/{encoded}/{date}");
     page(
         title,
         tree,
@@ -403,12 +409,13 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
             }
             div id="log" class="hide-events" data-date=(date)
                 data-latest=[is_today.then(|| format!("{bp}/{encoded}/latest"))]
+                data-follow=[ctx.follow.then_some("")]
                 data-presence=[ctx.presence.then(|| format!("{bp}/{encoded}/presence"))]
                 data-embed=[ctx.embeds.then(|| format!("{bp}/{encoded}/{date}/embed"))]
                 data-full-message=[ctx.full_message_lines.map(|_| format!("{bp}/{encoded}/{date}/fullmsg"))]
                 data-fold=[ctx.full_message_lines] {
                 @for (line, at) in lines {
-                    (render_line(line, at.map(|at| LineTime { at, zone: ctx.zone })))
+                    (render_line(line, at.map(|at| LineTime { at, zone: ctx.zone }), &day_url))
                 }
             }
         },
@@ -664,7 +671,7 @@ mod tests {
                 topic: "see https://poc.bcachefs.org/paper.pdf <script>alert(1)</script>".into(),
             },
         };
-        let out = render_line(&line, None).into_string();
+        let out = render_line(&line, None, "/c/2026-01-01").into_string();
         assert!(out.contains(r#"<a href="https://poc.bcachefs.org/paper.pdf""#));
         assert!(out.contains(" changed the topic to: "));
         assert!(out.contains(r#"class="line event""#));

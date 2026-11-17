@@ -24,6 +24,14 @@ use crate::znc::{Trigger, is_connected_line};
 use crate::{AppState, ChannelNode};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
+/// A line streamed to viewers, with the day file it was appended to: a page
+/// drops lines of an older day and, served as /today, reloads on a newer one.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LiveLine {
+    pub date: String,
+    pub html: String,
+}
+
 /// Tails the logs until the returned watcher is dropped, which closes its
 /// event channel and ends the tail thread.
 pub fn start_watcher(state: Arc<AppState>) -> notify::RecommendedWatcher {
@@ -83,9 +91,14 @@ fn tail_loop(
                 }
             }
 
-            let Some((channel_key, format)) = resolve_channel(path, state) else {
+            let Some((channel_key, format, url_path)) = resolve_channel(path, state) else {
                 continue;
             };
+            let date = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
 
             let new_lines = match offsets.new_lines(path) {
                 Ok(lines) => lines,
@@ -140,13 +153,23 @@ fn tail_loop(
                 continue;
             };
             let zone = clock.zone_name(format);
+            let day_url = format!(
+                "{}/{url_path}/{date}",
+                state
+                    .config
+                    .base_path
+            );
             for (line, at) in parsed
                 .iter()
                 .zip(stamps)
             {
                 let time = at.map(|at| LineTime { at, zone });
+                let live = LiveLine {
+                    date: date.clone(),
+                    html: render_line(line, time, &day_url).into_string(),
+                };
                 // An error only means no viewer is subscribed right now.
-                let _ = sender.send(render_line(line, time).into_string());
+                let _ = sender.send(live);
             }
         }
     }
@@ -270,7 +293,8 @@ fn dir_segments(path: &Path, state: &AppState) -> Option<Vec<String>> {
         })
 }
 
-fn resolve_channel(path: &PathBuf, state: &AppState) -> Option<(String, LogFormat)> {
+/// The key, file format and URL path of the channel `path` is a day file of.
+fn resolve_channel(path: &PathBuf, state: &AppState) -> Option<(String, LogFormat, String)> {
     let abs = std::fs::canonicalize(path).ok()?;
     let parent = abs.parent()?;
     for logs_dir in &state.logs_dirs {
@@ -293,7 +317,7 @@ fn resolve_channel(path: &PathBuf, state: &AppState) -> Option<(String, LogForma
                     .find(|d| parent.starts_with(&d.path))
                     .map(|d| d.format)
                     .unwrap_or(channel.dirs[0].format);
-                return Some((key, format));
+                return Some((key, format, channel.url_path()));
             }
         }
     }
@@ -413,10 +437,16 @@ mod tests {
             .await
             .expect("no line streamed within 5 s")
             .unwrap();
-        assert!(first.contains("after start"), "{first}");
+        assert_eq!(first.date, "2026-01-01");
+        let html = first.html;
+        assert!(html.contains("after start"), "{html}");
         assert!(
-            first.contains(r#"data-at="2026-01-01T00:00:01Z" title="file time 00:00:01 UTC""#),
-            "{first}"
+            html.contains(r#"href="/%23c/2026-01-01#T000001""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"data-at="2026-01-01T00:00:01Z" title="file time 00:00:01 UTC""#),
+            "{html}"
         );
         assert!(
             rx.try_recv()

@@ -453,8 +453,16 @@
         window.addEventListener('scroll', function() {
             atBottom = (window.innerHeight + window.scrollY) >= (document.body.offsetHeight - 50);
         });
+        // The stream carries every day file of the channel; dates compare as strings.
         tail.onmessage = function(e) {
-            log.insertAdjacentHTML('beforeend', e.data);
+            var live = JSON.parse(e.data);
+            if (live.date < log.dataset.date) return;
+            if (live.date > log.dataset.date) {
+                tail.close();
+                if (log.hasAttribute('data-follow')) location.reload();
+                return;
+            }
+            log.insertAdjacentHTML('beforeend', live.html);
             var added = log.lastElementChild;
             if (added && added.classList.contains('line')) {
                 showLineTimes(added);

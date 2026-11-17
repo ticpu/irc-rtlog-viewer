@@ -216,12 +216,11 @@ async fn wildcard(
         if let Some(channel) = find_channel(&state.channels, channel_segments).cloned() {
             return match action {
                 "today" => {
-                    let bp = &state
-                        .config
-                        .base_path;
-                    let encoded = channel.url_path();
-                    let date = latest_date(&channel);
-                    Redirect::temporary(&format!("{bp}/{encoded}/{date}")).into_response()
+                    off_runtime(move || {
+                        let date = latest_date(&channel);
+                        serve_log_page(&state, &channel, &date, true)
+                    })
+                    .await
                 }
                 "latest" => serve_sse(state, &channel)
                     .await
@@ -248,21 +247,19 @@ async fn wildcard(
                 }
                 date if looks_like_date(date) => {
                     let date = date.to_owned();
-                    off_runtime(move || serve_log_page(&state, &channel, &date)).await
+                    off_runtime(move || serve_log_page(&state, &channel, &date, false)).await
                 }
                 _ => (StatusCode::NOT_FOUND, "not found").into_response(),
             };
         }
     }
 
-    // Maybe bare channel path → redirect to latest date
     if let Some(channel) = find_channel(&state.channels, &segments) {
         let bp = &state
             .config
             .base_path;
         let encoded = channel.url_path();
-        let date = latest_date(channel);
-        return Redirect::temporary(&format!("{bp}/{encoded}/{date}")).into_response();
+        return Redirect::temporary(&format!("{bp}/{encoded}/today")).into_response();
     }
 
     (StatusCode::NOT_FOUND, "not found").into_response()
@@ -622,7 +619,14 @@ fn find_channel<'a>(node: &'a crate::ChannelNode, segments: &[&str]) -> Option<&
         .as_ref()
 }
 
-fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Response {
+/// The page of one day file; `follow` when served as /today, which no
+/// cache may keep past the day.
+fn serve_log_page(
+    state: &AppState,
+    channel: &crate::Channel,
+    date: &str,
+    follow: bool,
+) -> Response {
     let (path, format) = match resolve_log_path(channel, date) {
         Some(r) => r,
         None => {
@@ -671,7 +675,10 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
     let next = idx
         .and_then(|i| dates.get(i + 1))
         .map(|s| s.as_str());
-    let is_today = date == today_date();
+    // The newest file, not the UTC date: a ZNC day file follows log_timezone.
+    let is_today = dates
+        .last()
+        .is_some_and(|d| d == date);
 
     let mut resp = templates::log_page(&templates::LogPageContext {
         title: &state
@@ -685,6 +692,7 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
         prev_date: prev,
         next_date: next,
         is_today,
+        follow,
         ai_enabled: state
             .config
             .ai
@@ -717,7 +725,10 @@ fn serve_log_page(state: &AppState, channel: &crate::Channel, date: &str) -> Res
             .map(|e| e.full_message_lines),
     })
     .into_response();
-    let cc = if is_today {
+    // A cached /today from the day before would reload at every live line.
+    let cc = if follow {
+        "no-cache"
+    } else if is_today {
         "public, max-age=30, s-maxage=120"
     } else {
         "public, max-age=3600, s-maxage=86400"
@@ -918,9 +929,16 @@ async fn serve_sse(
     };
 
     let stream = BroadcastStream::new(rx).filter_map(|result| {
-        result
-            .ok()
-            .map(|html| Ok::<_, std::convert::Infallible>(Event::default().data(html)))
+        let line = result.ok()?;
+        match serde_json::to_string(&line) {
+            Ok(json) => Some(Ok::<_, std::convert::Infallible>(
+                Event::default().data(json),
+            )),
+            Err(e) => {
+                eprintln!("sse: cannot encode a line of {}: {e}", line.date);
+                None
+            }
+        }
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -1317,26 +1335,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_channel_redirects_with_or_without_trailing_slash() {
+    async fn bare_channel_redirects_to_today_with_or_without_trailing_slash() {
         for uri in ["/OFTC/%23bcache", "/OFTC/%23bcache/"] {
             let (status, location) = get_status(uri).await;
             assert_eq!(status, StatusCode::TEMPORARY_REDIRECT, "{uri}");
-            let location = location.unwrap();
-            assert!(
-                location.starts_with("/OFTC/%23bcache/"),
-                "{uri} -> {location}"
-            );
-            assert!(
-                looks_like_date(&location["/OFTC/%23bcache/".len()..]),
-                "{uri} -> {location}"
-            );
+            assert_eq!(location.as_deref(), Some("/OFTC/%23bcache/today"), "{uri}");
+        }
+    }
+
+    /// `#c` with two day files in ZNC format, the newest 2026-01-02.
+    fn two_day_channel(root: &Path) -> axum::Router {
+        std::fs::write(root.join("2026-01-01.log"), "[10:00:00] <a> day one\n").unwrap();
+        std::fs::write(root.join("2026-01-02.log"), "[10:00:00] <a> day two\n").unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: root.to_owned(),
+            format: LogFormat::Znc,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        app(Arc::new(app_state(channels, "logs_dirs: []")), PEER)
+    }
+
+    #[tokio::test]
+    async fn today_serves_the_newest_day_in_place_and_follows_it() {
+        let root = tempdir();
+        let app = two_day_channel(root.path());
+        for uri in ["/%23c/today", "/%23c/today/"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::get(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-cache", "{uri}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(body.contains("day two"), "{uri}: {body}");
+            assert!(!body.contains("day one"), "{uri}: {body}");
+            assert!(body.contains(r#"data-date="2026-01-02""#), "{uri}");
+            assert!(body.contains(r#"data-latest="/%23c/latest""#), "{uri}");
+            assert!(body.contains("data-follow"), "{uri}");
+            assert!(body.contains(r#"href="/%23c/2026-01-02#T100000""#), "{uri}");
         }
     }
 
     #[tokio::test]
-    async fn today_resolves_with_trailing_slash() {
-        let (status, _) = get_status("/OFTC/%23bcache/today/").await;
-        assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    async fn only_the_newest_dated_page_is_live_and_neither_follows() {
+        let root = tempdir();
+        let app = two_day_channel(root.path());
+        let newest = body_of(&app, "/%23c/2026-01-02").await;
+        assert!(newest.contains("data-latest"), "{newest}");
+        assert!(!newest.contains("data-follow"), "{newest}");
+        let older = body_of(&app, "/%23c/2026-01-01").await;
+        assert!(!older.contains("data-latest"), "{older}");
+        assert!(!older.contains("data-follow"), "{older}");
     }
 
     #[tokio::test]
@@ -1671,7 +1729,7 @@ mod tests {
             ("01:10:00", "T011000", "2026-11-01T06:10:00Z"),
         ] {
             let link = format!(
-                r##"<a class="ts" href="#{anchor}" data-at="{at}" title="file time {hms} {posix}">{hms}</a>"##
+                r##"<a class="ts" href="/%23z/2026-11-01#{anchor}" data-at="{at}" title="file time {hms} {posix}">{hms}</a>"##
             );
             assert!(page.contains(&link), "{link} missing: {page}");
             assert!(page.contains(&format!(r#"id="{anchor}""#)), "{page}");
@@ -1679,7 +1737,7 @@ mod tests {
         assert!(page.contains(r#"data-date="2026-11-01""#), "{page}");
 
         let page = body_of(&app, "/%23i/2026-11-01").await;
-        let link = r##"<a class="ts" href="#T235959" data-at="2026-11-01T23:59:59Z" title="file time 23:59:59 UTC">23:59:59</a>"##;
+        let link = r##"<a class="ts" href="/%23i/2026-11-01#T235959" data-at="2026-11-01T23:59:59Z" title="file time 23:59:59 UTC">23:59:59</a>"##;
         assert!(page.contains(link), "{page}");
 
         let found = body_of(&app, "/%23z/search?q=second").await;

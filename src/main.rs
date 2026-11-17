@@ -315,7 +315,7 @@ pub struct AppState {
     /// Channel tree discovered at startup.
     pub channels: ChannelNode,
     /// Live-tail broadcasters, keyed by channel path.
-    pub sse_senders: RwLock<HashMap<String, broadcast::Sender<String>>>,
+    pub sse_senders: RwLock<HashMap<String, broadcast::Sender<tail::LiveLine>>>,
     /// Bounds concurrent ask sessions; `None` when AI is disabled.
     pub ai_semaphore: Option<Arc<Semaphore>>,
     /// HTTP client for the Anthropic API; `None` when AI is disabled.
