@@ -258,7 +258,7 @@ The `base_path` value is normalized on startup: `irc`, `/irc`, and `/irc/` all r
 
 ## Features
 
-- **Real-time tail**: the newest day file's page auto-updates via SSE as new messages arrive; `<channel>/today`, where a bare channel URL leads, serves that page under its own URL and reloads into the next day when its first line arrives
+- **Real-time tail**: the newest day file's page auto-updates via SSE as new messages arrive; `<channel>/today`, where a bare channel URL leads, serves that page under its own URL, preceded by the previous day file's last 12 hours, and reloads into the next day when its first line arrives
 - **Full-text search**: substring search across all dates for a channel
 - **AI search** (optional): natural language queries powered by Claude, with regex log search, markdown output, and permanent result links
 - **Compressed logs**: transparent reading of `.log.zst` files

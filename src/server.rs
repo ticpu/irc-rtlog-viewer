@@ -14,6 +14,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use cookie::{Cookie, SameSite};
+use jiff::{SignedDuration, Timestamp};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -24,10 +25,13 @@ use crate::AppState;
 use crate::embed;
 use crate::limits;
 use crate::live::LiveChannel;
-use crate::parser::{LineKind, LogFormat, parse_line};
-use crate::presence::{ChannelPresence, json_body};
+use crate::parser::{LineKind, LogFormat, LogLine, parse_line};
+use crate::presence::{ChannelPresence, LogClock, json_body};
 use crate::search::search_channel;
 use crate::templates;
+
+/// How far back /today reaches into the previous day file.
+const TODAY_CARRY_HOURS: i64 = 12;
 
 static CSS: &str = include_str!("../static/style.css");
 static JS: &str = include_str!("../static/app.js");
@@ -218,7 +222,9 @@ async fn wildcard(
                 "today" => {
                     off_runtime(move || {
                         let date = latest_date(&channel);
-                        serve_log_page(&state, &channel, &date, true)
+                        let since =
+                            Timestamp::now() - SignedDuration::from_hours(TODAY_CARRY_HOURS);
+                        serve_log_page(&state, &channel, &date, Some(since))
                     })
                     .await
                 }
@@ -247,7 +253,7 @@ async fn wildcard(
                 }
                 date if looks_like_date(date) => {
                     let date = date.to_owned();
-                    off_runtime(move || serve_log_page(&state, &channel, &date, false)).await
+                    off_runtime(move || serve_log_page(&state, &channel, &date, None)).await
                 }
                 _ => (StatusCode::NOT_FOUND, "not found").into_response(),
             };
@@ -619,41 +625,22 @@ fn find_channel<'a>(node: &'a crate::ChannelNode, segments: &[&str]) -> Option<&
         .as_ref()
 }
 
-/// The page of one day file; `follow` when served as /today, which no
-/// cache may keep past the day.
-fn serve_log_page(
-    state: &AppState,
-    channel: &crate::Channel,
-    date: &str,
-    follow: bool,
-) -> Response {
-    let (path, format) = match resolve_log_path(channel, date) {
-        Some(r) => r,
-        None => {
-            return (StatusCode::NOT_FOUND, format!("no log for {date}")).into_response();
-        }
-    };
-    let content = match read_log_file(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read error: {e}"),
-            )
-                .into_response();
-        }
-    };
-
+/// The lines of the day file `path` with their UTC stamps.
+fn stamped_lines(
+    clock: &mut LogClock,
+    path: &Path,
+    format: LogFormat,
+) -> io::Result<Vec<(LogLine, Option<Timestamp>)>> {
+    let content = read_log_file(path)?;
     let parsed: Vec<_> = content
         .lines()
         .filter_map(|l| parse_line(l, format))
         .collect();
-    let mut clock = state.log_clock();
     let stamps = clock
-        .stamp(&path, format, &parsed)
+        .stamp(path, format, &parsed)
         .unwrap_or_default();
     let mut stamps = stamps.into_iter();
-    let lines: Vec<_> = parsed
+    Ok(parsed
         .into_iter()
         .map(|line| {
             (
@@ -663,7 +650,63 @@ fn serve_log_page(
                     .flatten(),
             )
         })
+        .collect())
+}
+
+/// The lines of the day file `date` stamped at or after `since`.
+fn carried_day(
+    clock: &mut LogClock,
+    channel: &crate::Channel,
+    date: &str,
+    since: Timestamp,
+) -> Option<templates::CarriedDay> {
+    let (path, format) = resolve_log_path(channel, date)?;
+    let lines = match stamped_lines(clock, &path, format) {
+        Ok(lines) => lines,
+        Err(e) => {
+            eprintln!("today: cannot read {} to carry over: {e}", path.display());
+            return None;
+        }
+    };
+    let lines: Vec<_> = lines
+        .into_iter()
+        .filter(|(_, at)| at.is_some_and(|at| at >= since))
         .collect();
+    (!lines.is_empty()).then(|| templates::CarriedDay {
+        date: date.to_owned(),
+        lines,
+        zone: clock
+            .zone_name(format)
+            .to_owned(),
+    })
+}
+
+/// The page of one day file. `today_since` is set when served as /today,
+/// which no cache may keep past the day: lines of the previous day file
+/// stamped since then come first.
+fn serve_log_page(
+    state: &AppState,
+    channel: &crate::Channel,
+    date: &str,
+    today_since: Option<Timestamp>,
+) -> Response {
+    let (path, format) = match resolve_log_path(channel, date) {
+        Some(r) => r,
+        None => {
+            return (StatusCode::NOT_FOUND, format!("no log for {date}")).into_response();
+        }
+    };
+    let mut clock = state.log_clock();
+    let lines = match stamped_lines(&mut clock, &path, format) {
+        Ok(lines) => lines,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read error: {e}"),
+            )
+                .into_response();
+        }
+    };
 
     let dates = channel_dates(channel);
     let idx = dates
@@ -672,6 +715,10 @@ fn serve_log_page(
     let prev = idx
         .and_then(|i| if i > 0 { dates.get(i - 1) } else { None })
         .map(|s| s.as_str());
+    let follow = today_since.is_some();
+    let carried = today_since
+        .zip(prev)
+        .and_then(|(since, prev)| carried_day(&mut clock, channel, prev, since));
     let next = idx
         .and_then(|i| dates.get(i + 1))
         .map(|s| s.as_str());
@@ -693,6 +740,7 @@ fn serve_log_page(
         next_date: next,
         is_today,
         follow,
+        carried: carried.as_ref(),
         ai_enabled: state
             .config
             .ai
@@ -1383,6 +1431,68 @@ mod tests {
             assert!(body.contains("data-follow"), "{uri}");
             assert!(body.contains(r#"href="/%23c/2026-01-02#T100000""#), "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn today_carries_the_previous_day_lines_since_the_cutoff() {
+        let root = tempdir();
+        std::fs::write(
+            root.path()
+                .join("2026-01-01.log"),
+            "[14:59:59] <a> too old\n[15:00:00] <a> carried over\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path()
+                .join("2026-01-02.log"),
+            "[10:00:00] <a> day two\n",
+        )
+        .unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: root
+                .path()
+                .to_owned(),
+            format: LogFormat::Znc,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        let state = app_state(channels, "logs_dirs: []");
+        let channel = find_channel(&state.channels, &["#c"]).unwrap();
+        let page = |since: &str| {
+            let since = since
+                .parse()
+                .unwrap();
+            serve_log_page(&state, channel, "2026-01-02", Some(since))
+        };
+        async fn text(resp: Response) -> String {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+
+        let body = text(page("2026-01-01T15:00:00Z")).await;
+        assert!(!body.contains("too old"), "{body}");
+        let carried = body
+            .find(r#"<div class="carried" data-date="2026-01-01">"#)
+            .expect("carried section");
+        let line = body
+            .find(r#"href="/%23c/2026-01-01#T150000""#)
+            .expect("carried line links to its own day");
+        let separator = body
+            .find(r#"<div class="day-separator"><a href="/%23c/2026-01-02">2026-01-02</a></div>"#)
+            .expect("separator");
+        let today = body
+            .find("day two")
+            .expect("today's line");
+        assert!(
+            carried < line && line < separator && separator < today,
+            "{body}"
+        );
+
+        let body = text(page("2026-01-01T15:00:01Z")).await;
+        assert!(!body.contains("carried"), "{body}");
+        assert!(!body.contains("day-separator"), "{body}");
     }
 
     #[tokio::test]

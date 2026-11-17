@@ -91,11 +91,16 @@
         return el;
     };
 
+    // A line's day container: #log, or the previous day's lines carried onto /today,
+    // which name that day's endpoints.
+    var dayOf = function(el) {
+        return el.closest('[data-date]') || {dataset: {}};
+    };
+
     // OpenGraph cards come from the server, which fetches only links it
     // finds in the day's log; the href is sent as written, never a.href.
-    var cardEndpoint = (document.getElementById('log') || {dataset: {}}).dataset.embed;
     var addCard = function(line, box, href) {
-        fetch(cardEndpoint + '?url=' + encodeURIComponent(href)).then(function(resp) {
+        fetch(dayOf(line).dataset.embed + '?url=' + encodeURIComponent(href)).then(function(resp) {
             return resp.ok ? resp.json() : null;
         }).then(function(card) {
             if (!card || !(card.title || card.description)) return;
@@ -140,7 +145,7 @@
             var el = embedFor(href);
             if (el) {
                 box.appendChild(el);
-            } else if (cardEndpoint) {
+            } else if (dayOf(line).dataset.embed) {
                 addCard(line, box, href);
             }
         }
@@ -213,8 +218,7 @@
             partsFormat.formatToParts(new Date(links[i].getAttribute('data-at'))).forEach(function(p) {
                 parts[p.type] = p.value;
             });
-            var dayOf = links[i].closest('[data-date]');
-            var fileDate = dayOf ? dayOf.getAttribute('data-date') : null;
+            var fileDate = dayOf(links[i]).dataset.date;
             var date = parts.year + '-' + parts.month + '-' + parts.day;
             links[i].textContent = (fileDate && date !== fileDate ? parts.month + '-' + parts.day + ' ' : '') +
                 parts.hour + ':' + parts.minute + ':' + parts.second;
@@ -276,7 +280,7 @@
         span.removeAttribute('data-full-message');
         var nickEl = span.parentElement.querySelector('span.nick[data-nick]');
         if (!nickEl) return;
-        fetch(fullMessageEndpoint + '?url=' + encodeURIComponent(href) +
+        fetch(dayOf(span).dataset.fullMessage + '?url=' + encodeURIComponent(href) +
             '&nick=' + encodeURIComponent(nickEl.getAttribute('data-nick'))).then(function(resp) {
             return resp.ok ? resp.json() : null;
         }).then(function(body) {

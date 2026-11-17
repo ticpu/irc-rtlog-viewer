@@ -312,6 +312,13 @@ pub fn page(title: &str, tree: &ChannelNode, base_path: &str, content: Markup) -
     }
 }
 
+/// Lines of another day file shown on a page, with the zone of their file times.
+pub struct CarriedDay {
+    pub date: String,
+    pub lines: Vec<(LogLine, Option<Timestamp>)>,
+    pub zone: String,
+}
+
 pub struct LogPageContext<'a> {
     pub title: &'a str,
     pub tree: &'a ChannelNode,
@@ -327,6 +334,8 @@ pub struct LogPageContext<'a> {
     pub is_today: bool,
     /// Served as /today: app.js reloads when the tail reaches a newer day.
     pub follow: bool,
+    /// The end of the previous day file, shown before `lines` on /today.
+    pub carried: Option<&'a CarriedDay>,
     pub ai_enabled: bool,
     pub base_path: &'a str,
     pub search_max_len: usize,
@@ -414,6 +423,17 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                 data-embed=[ctx.embeds.then(|| format!("{bp}/{encoded}/{date}/embed"))]
                 data-full-message=[ctx.full_message_lines.map(|_| format!("{bp}/{encoded}/{date}/fullmsg"))]
                 data-fold=[ctx.full_message_lines] {
+                @if let Some(carried) = ctx.carried {
+                    @let carried_url = format!("{bp}/{encoded}/{}", carried.date);
+                    div.carried data-date=(&carried.date)
+                        data-embed=[ctx.embeds.then(|| format!("{carried_url}/embed"))]
+                        data-full-message=[ctx.full_message_lines.map(|_| format!("{carried_url}/fullmsg"))] {
+                        @for (line, at) in &carried.lines {
+                            (render_line(line, at.map(|at| LineTime { at, zone: &carried.zone }), &carried_url))
+                        }
+                    }
+                    div.day-separator { a href=(&day_url) { (date) } }
+                }
                 @for (line, at) in lines {
                     (render_line(line, at.map(|at| LineTime { at, zone: ctx.zone }), &day_url))
                 }
