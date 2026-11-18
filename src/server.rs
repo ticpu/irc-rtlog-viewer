@@ -1,6 +1,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use axum::Router;
@@ -228,7 +229,7 @@ async fn wildcard(
                     })
                     .await
                 }
-                "latest" => serve_sse(state, &channel)
+                "latest" => serve_sse(state, &channel, addr, &headers)
                     .await
                     .into_response(),
                 "search" => {
@@ -958,9 +959,96 @@ fn etag_matches(if_none_match: &str, etag: &str) -> bool {
         })
 }
 
+/// Prefix of every stream id: an epoch second and random bits drawn by this
+/// run, so ids stay unique across restarts. The ujail makes every pid 1.
+static SSE_RUN: LazyLock<String> = LazyLock::new(|| {
+    let epoch = Timestamp::now().as_second();
+    match getrandom::u32() {
+        Ok(tag) => format!("{epoch}-{tag:08x}"),
+        Err(e) => {
+            eprintln!("sse: cannot draw a run tag, stream ids carry the epoch only: {e}");
+            epoch.to_string()
+        }
+    }
+});
+static SSE_NEXT: AtomicU64 = AtomicU64::new(1);
+
+/// One open /latest stream: logs `sse: open` when made and `sse: close` when
+/// the response stream is dropped, which is when the proxy closes the connection.
+/// Keys keep a fixed order with the unquoted ones first, so a reader can split
+/// on spaces; channel and ua are Rust-debug-quoted, which also escapes newlines.
+struct SseStreamLog {
+    id: String,
+    client: IpAddr,
+    channel: String,
+    started: std::time::Instant,
+    msgs: u64,
+}
+
+impl SseStreamLog {
+    fn open(client: IpAddr, channel: String, headers: &HeaderMap) -> Self {
+        let log = Self {
+            id: format!("{}-{}", *SSE_RUN, SSE_NEXT.fetch_add(1, Ordering::Relaxed)),
+            client,
+            channel,
+            started: std::time::Instant::now(),
+            msgs: 0,
+        };
+        sse_log(log.open_line(headers));
+        log
+    }
+
+    fn open_line(&self, headers: &HeaderMap) -> String {
+        let ua = headers
+            .get(header::USER_AGENT)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()))
+            .unwrap_or_default();
+        format!(
+            "sse: open id={} client={} channel={:?} ua={ua:?}",
+            self.id, self.client, self.channel
+        )
+    }
+
+    fn close_line(&self) -> String {
+        format!(
+            "sse: close id={} client={} secs={} msgs={} channel={:?}",
+            self.id,
+            self.client,
+            self.started
+                .elapsed()
+                .as_secs(),
+            self.msgs,
+            self.channel
+        )
+    }
+}
+
+impl Drop for SseStreamLog {
+    fn drop(&mut self) {
+        sse_log(self.close_line());
+    }
+}
+
+#[cfg(not(test))]
+fn sse_log(line: String) {
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static SSE_LOG: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn sse_log(line: String) {
+    SSE_LOG.with_borrow_mut(|lines| lines.push(line));
+}
+
 async fn serve_sse(
     state: Arc<AppState>,
     channel: &crate::Channel,
+    client: IpAddr,
+    headers: &HeaderMap,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let key = channel
         .path_segments
@@ -971,17 +1059,24 @@ async fn serve_sse(
             .write()
             .await;
         let sender = senders
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| broadcast::channel(256).0);
         sender.subscribe()
     };
 
-    let stream = BroadcastStream::new(rx).filter_map(|result| {
+    // Owned by the stream so its Drop marks the end of the connection. The
+    // whole-variable borrow stops the closure capturing only `log.msgs`.
+    let mut log = SseStreamLog::open(client, key, headers);
+    let stream = BroadcastStream::new(rx).filter_map(move |result| {
+        let log = &mut log;
         let line = result.ok()?;
         match serde_json::to_string(&line) {
-            Ok(json) => Some(Ok::<_, std::convert::Infallible>(
-                Event::default().data(json),
-            )),
+            Ok(json) => {
+                log.msgs += 1;
+                Some(Ok::<_, std::convert::Infallible>(
+                    Event::default().data(json),
+                ))
+            }
             Err(e) => {
                 eprintln!("sse: cannot encode a line of {}: {e}", line.date);
                 None
@@ -1772,6 +1867,57 @@ mod tests {
     async fn unknown_channel_is_not_found() {
         let (status, _) = get_status("/OFTC/%23nope/").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn latest_logs_its_client_on_open_and_its_messages_on_close() {
+        let mut channels = ChannelNode::default();
+        add_channel(&mut channels, &["#c"], Vec::new());
+        let state = Arc::new(app_state(channels, "logs_dirs: []"));
+        let resp = app(Arc::clone(&state), "[::1]:5000")
+            .oneshot(
+                Request::get("/%23c/latest")
+                    .header("x-real-ip", "2001:db8::7")
+                    .header(header::USER_AGENT, r#"UA "quoted""#)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .sse_senders
+            .read()
+            .await["#c"]
+            .send(crate::tail::LiveLine {
+                date: "2026-01-01".into(),
+                html: "x".into(),
+            })
+            .unwrap();
+        let mut body = resp
+            .into_body()
+            .into_data_stream();
+        body.next()
+            .await
+            .unwrap()
+            .unwrap();
+        drop(body);
+
+        let lines = SSE_LOG.take();
+        let [open, close] = lines.as_slice() else {
+            panic!("{lines:?}");
+        };
+        let id = open
+            .split(' ')
+            .nth(2)
+            .unwrap();
+        assert_eq!(
+            *open,
+            format!(r##"sse: open {id} client=2001:db8::7 channel="#c" ua="UA \"quoted\"""##)
+        );
+        assert_eq!(
+            *close,
+            format!(r##"sse: close {id} client=2001:db8::7 secs=0 msgs=1 channel="#c""##)
+        );
     }
 
     async fn body_of(app: &axum::Router, uri: &str) -> String {

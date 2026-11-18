@@ -256,6 +256,17 @@ server {
 
 The `base_path` value is normalized on startup: `irc`, `/irc`, and `/irc/` all resolve to `/irc`.
 
+### Live viewers
+
+Each `<channel>/latest` stream logs a line to stderr when it opens and another when it closes, sharing an id unique across restarts:
+
+```
+sse: open id=1794970202-9f3c01ab-17 client=2001:db8::7 channel="OFTC/#bcache" ua="Mozilla/5.0 ..."
+sse: close id=1794970202-9f3c01ab-17 client=2001:db8::7 secs=342 msgs=12 channel="OFTC/#bcache"
+```
+
+`client` is the X-Real-IP header when the proxy connecting to the viewer is listed in `trusted_proxies`, else the proxy's own address, so a proxy on another host must be listed there. `msgs` counts the lines pushed to that viewer. Keys keep this order, `id`, `client`, `secs` and `msgs` are unquoted, and `channel` and `ua` are Rust-debug-quoted. An open line without its close is a stream still open, or one cut by a crash or kill.
+
 ## Features
 
 - **Real-time tail**: the newest day file's page auto-updates via SSE as new messages arrive; `<channel>/today`, where a bare channel URL leads, serves that page under its own URL, preceded by the previous day file's last 12 hours, and reloads into the next day when its first line arrives
