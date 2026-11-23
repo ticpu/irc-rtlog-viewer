@@ -106,8 +106,8 @@ use serde_saphyr::{Budget, SerializerOptions};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::live::{LiveChannel, ModeLine, ModeSpec};
+use crate::logfiles::read_log_file;
 use crate::parser::{LineKind, LogFormat, LogLine, Time, parse_line};
-use crate::server::read_log_file;
 use crate::{ChannelDir, ChannelNode, yaml_options};
 
 const INDEX_VERSION: u32 = 2;

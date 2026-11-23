@@ -22,6 +22,7 @@ mod ai;
 mod embed;
 mod limits;
 mod live;
+mod logfiles;
 mod parser;
 mod presence;
 mod search;
@@ -826,7 +827,7 @@ fn detect_channel_format(dir: &Path) -> LogFormat {
             .to_string_lossy()
             .to_string();
         if name.ends_with(".log") || name.ends_with(".log.zst") {
-            if let Ok(content) = server::read_log_file(&entry.path()) {
+            if let Ok(content) = logfiles::read_log_file(&entry.path()) {
                 if let Some(first_line) = content
                     .lines()
                     .next()

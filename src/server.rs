@@ -1,5 +1,5 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, BufReader, Read};
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -26,6 +26,9 @@ use crate::AppState;
 use crate::embed;
 use crate::limits;
 use crate::live::LiveChannel;
+use crate::logfiles::{
+    channel_dates, latest_date, looks_like_date, read_log_file, resolve_log_path, today_date,
+};
 use crate::parser::{LineKind, LogFormat, LogLine, parse_line};
 use crate::presence::{ChannelPresence, LogClock, json_body};
 use crate::search::search_channel;
@@ -599,46 +602,6 @@ async fn serve_embed(
     }
 }
 
-fn looks_like_date(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 10
-        && b[4] == b'-'
-        && b[7] == b'-'
-        && b[..4]
-            .iter()
-            .all(u8::is_ascii_digit)
-        && b[5..7]
-            .iter()
-            .all(u8::is_ascii_digit)
-        && b[8..10]
-            .iter()
-            .all(u8::is_ascii_digit)
-}
-
-pub fn today_date() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let days = now / 86400;
-    epoch_days_to_date(days)
-}
-
-fn epoch_days_to_date(days: u64) -> String {
-    // Civil date from days since epoch (Euclidean affine algorithm)
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 fn find_channel<'a>(node: &'a crate::ChannelNode, segments: &[&str]) -> Option<&'a crate::Channel> {
     let mut current = node;
     for seg in segments {
@@ -1110,89 +1073,6 @@ async fn serve_sse(
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
-/// A day file's text, decompressed when it ends in `.zst`. Invalid UTF-8 is
-/// replaced with U+FFFD, as in the tail, so one stray byte does not cost the whole day.
-pub fn read_log_file(path: &Path) -> io::Result<String> {
-    let file = std::fs::File::open(path)?;
-    let mut bytes = Vec::new();
-
-    if path
-        .extension()
-        .and_then(|e| e.to_str())
-        == Some("zst")
-    {
-        let mut decoder = zstd::Decoder::new(BufReader::new(file))?;
-        decoder.read_to_end(&mut bytes)?;
-    } else {
-        let mut reader = BufReader::new(file);
-        reader.read_to_end(&mut bytes)?;
-    }
-
-    Ok(String::from_utf8(bytes)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
-}
-
-pub fn resolve_log_path(
-    channel: &crate::Channel,
-    date: &str,
-) -> Option<(std::path::PathBuf, LogFormat)> {
-    // Callers include the AI tools, whose date is model output.
-    if !looks_like_date(date) {
-        return None;
-    }
-    for dir in &channel.dirs {
-        let plain = dir
-            .path
-            .join(format!("{date}.log"));
-        if plain.exists() {
-            return Some((plain, dir.format));
-        }
-        let zst = dir
-            .path
-            .join(format!("{date}.log.zst"));
-        if zst.exists() {
-            return Some((zst, dir.format));
-        }
-    }
-    None
-}
-
-fn latest_date(channel: &crate::Channel) -> String {
-    let dates = channel_dates(channel);
-    dates
-        .last()
-        .cloned()
-        .unwrap_or_else(today_date)
-}
-
-pub fn channel_dates(channel: &crate::Channel) -> Vec<String> {
-    let mut dates = std::collections::BTreeSet::new();
-    for dir in &channel.dirs {
-        let Ok(entries) = std::fs::read_dir(&dir.path) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(name) = entry
-                .file_name()
-                .into_string()
-            else {
-                continue;
-            };
-            let date = name
-                .strip_suffix(".log")
-                .or_else(|| name.strip_suffix(".log.zst"));
-            if let Some(d) = date {
-                if d.len() == 10 {
-                    dates.insert(d.to_string());
-                }
-            }
-        }
-    }
-    dates
-        .into_iter()
-        .collect()
 }
 
 fn serve_ask_page(state: &AppState, channel: &crate::Channel, headers: &HeaderMap) -> Response {

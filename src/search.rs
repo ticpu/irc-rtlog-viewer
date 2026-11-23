@@ -1,9 +1,9 @@
 use jiff::Timestamp;
 
 use crate::Channel;
+use crate::logfiles::{channel_dates, read_log_file, resolve_log_path};
 use crate::parser::{LogLine, parse_line};
 use crate::presence::LogClock;
-use crate::server::{channel_dates, read_log_file, resolve_log_path};
 
 /// One matching line.
 pub struct Found {
