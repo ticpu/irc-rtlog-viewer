@@ -15,6 +15,10 @@ use axum::extract::connect_info::MockConnectInfo;
 
 use crate::limits::Limits;
 use crate::parser::LogFormat;
+use axum::body::Body;
+use axum::http::{HeaderMap, Request, StatusCode};
+use tower::ServiceExt;
+
 use crate::{AppState, Channel, ChannelDir, ChannelNode, parse_config};
 
 pub fn add_channel(root: &mut ChannelNode, segments: &[&str], dirs: Vec<ChannelDir>) {
@@ -106,4 +110,55 @@ pub fn stalled_channel() -> (tempfile::TempDir, ChannelNode, Sender<()>, JoinHan
         timed_out
     });
     (root, channels, release, writer)
+}
+
+pub const PEER: &str = "192.0.2.1:4000";
+
+/// A `#c` channel with one log file per `(date, line)`.
+pub fn channel_with_logs(days: &[(&str, &str)]) -> (tempfile::TempDir, ChannelNode) {
+    let root = tempdir();
+    for (date, text) in days {
+        std::fs::write(
+            root.path()
+                .join(format!("{date}.log")),
+            format!("{date}T00:00:00Z <a> {text}\n"),
+        )
+        .unwrap();
+    }
+    let mut channels = ChannelNode::default();
+    let dirs = vec![ChannelDir {
+        path: root
+            .path()
+            .to_owned(),
+        format: LogFormat::Iso8601,
+    }];
+    add_channel(&mut channels, &["#c"], dirs);
+    (root, channels)
+}
+
+pub async fn get(
+    app: &Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, String) {
+    let mut req = Request::get(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            req.body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp
+        .headers()
+        .clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8(body.to_vec()).unwrap())
 }
