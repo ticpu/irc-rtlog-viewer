@@ -2046,6 +2046,46 @@ mod tests {
             "{found}"
         );
     }
+
+    #[tokio::test]
+    async fn search_renders_events_as_the_day_page_does() {
+        let root = tempdir();
+        std::fs::write(
+            root.path()
+                .join("2026-01-01.log"),
+            "[10:00:00] *** Joins: needle (~n@host)\n[10:01:00] *** needle is now known as pin\n",
+        )
+        .unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: root
+                .path()
+                .to_owned(),
+            format: LogFormat::Znc,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        let app = app(Arc::new(app_state(channels, "logs_dirs: []")), PEER);
+
+        let day = body_of(&app, "/%23c/2026-01-01").await;
+        let found = body_of(&app, "/%23c/search?q=needle").await;
+        assert!(!found.contains(">event<"), "{found}");
+        for anchor in ["T100000", "T100100"] {
+            let start = format!(r#"<div class="line event" id="{anchor}">"#);
+            let body = day
+                .split_once(&start)
+                .and_then(|(_, rest)| rest.split_once("</div>"))
+                .unwrap_or_else(|| panic!("{start} missing: {day}"))
+                .0;
+            let ts = body
+                .find(r#"<a class="ts""#)
+                .unwrap();
+            assert!(found.contains(&body[ts..]), "{body} missing: {found}");
+            assert!(
+                found.contains(r#"<div class="line event" data-date="2026-01-01">"#),
+                "{found}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

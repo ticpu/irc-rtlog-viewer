@@ -165,19 +165,33 @@ fn time_link(href: &str, line: &LogLine, time: Option<LineTime>) -> Markup {
     }
 }
 
+/// The `class` of a line's div; style.css and app.js hide `event` lines.
+fn line_class(line: &LogLine) -> &'static str {
+    if line.is_event() {
+        "line event"
+    } else {
+        "line"
+    }
+}
+
 /// A line of the day file whose page is at `day_url`.
 pub fn render_line(line: &LogLine, time: Option<LineTime>, day_url: &str) -> Markup {
     let anchor = line
         .time
         .to_anchor();
-    let class = if line.is_event() {
-        "line event"
-    } else {
-        "line"
-    };
-
     html! {
-        div class=(class) id=(&anchor) {
+        div class=(line_class(line)) id=(&anchor) {
+            (line_body(line, time, day_url))
+        }
+    }
+}
+
+/// A line's time link and content, shared by the day and search pages.
+fn line_body(line: &LogLine, time: Option<LineTime>, day_url: &str) -> Markup {
+    let anchor = line
+        .time
+        .to_anchor();
+    html! {
             (time_link(&format!("{day_url}#{anchor}"), line, time))
             " "
             @match &line.kind {
@@ -259,7 +273,6 @@ pub fn render_line(line: &LogLine, time: Option<LineTime>, day_url: &str) -> Mar
                     span.ev { "*** " (text) }
                 },
             }
-        }
     }
 }
 
@@ -486,32 +499,13 @@ pub fn search_page(
                 @for found in &results.lines {
                     @let date = &found.date;
                     @let line = &found.line;
-                    @let href = format!("{base_path}/{encoded}/{date}#{}", line.time.to_anchor());
-                    div.line data-date=(date) {
-                        a.date href=(&href) {
+                    @let day_url = format!("{base_path}/{encoded}/{date}");
+                    div class=(line_class(line)) data-date=(date) {
+                        a.date href=(format!("{day_url}#{}", line.time.to_anchor())) {
                             (date)
                         }
                         " "
-                        (time_link(&href, line, found.at.map(|at| LineTime { at, zone: &found.zone })))
-                        " "
-                        @match &line.kind {
-                            LineKind::Message { nick, text } => {
-                                span.nick data-nick=(nick) style=(nick_color_style(nick)) { "<" (nick) ">" }
-                                " "
-                                span.msg { (linkify(text)) }
-                            },
-                            LineKind::Action { nick, text } => {
-                                span.action {
-                                    "* "
-                                    (nick_span(nick))
-                                    " "
-                                    (linkify(text))
-                                }
-                            },
-                            _ => {
-                                span.ev { "event" }
-                            },
-                        }
+                        (line_body(line, found.at.map(|at| LineTime { at, zone: &found.zone }), &day_url))
                     }
                 }
             }
