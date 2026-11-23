@@ -375,9 +375,7 @@ main.standalone { margin: 0 auto; max-width: 800px; padding: 1em; overflow-wrap:
 }
 
 .full-message {
-    display: inline-block;
-    vertical-align: top;
-    max-width: 100%;
+    display: block;
 }
 
 .full-text {
