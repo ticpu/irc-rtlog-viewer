@@ -36,6 +36,8 @@ const TODAY_CARRY_HOURS: i64 = 12;
 
 static CSS: &str = include_str!("../static/style.css");
 static JS: &str = include_str!("../static/app.js");
+static ICON: &[u8] = include_bytes!("../static/icon-32.png");
+static TOUCH_ICON: &[u8] = include_bytes!("../static/apple-touch-icon.png");
 
 /// Asset URLs carry a hash of their content: browsers and proxies keep them for
 /// a day or more, and a page must never pair new markup with an old script.
@@ -43,8 +45,16 @@ pub static CSS_URL: LazyLock<String> =
     LazyLock::new(|| format!("/static/style.css?v={}", content_version(CSS)));
 pub static JS_URL: LazyLock<String> =
     LazyLock::new(|| format!("/static/app.js?v={}", content_version(JS)));
+pub static ICON_URL: LazyLock<String> =
+    LazyLock::new(|| format!("/static/icon-32.png?v={}", content_version(ICON)));
+pub static TOUCH_ICON_URL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "/static/apple-touch-icon.png?v={}",
+        content_version(TOUCH_ICON)
+    )
+});
 
-fn content_version(content: &str) -> String {
+fn content_version<T: Hash + ?Sized>(content: &T) -> String {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -59,7 +69,7 @@ fn content_version(content: &str) -> String {
 /// its markdown embeds verbatim IRC lines, and an attacker-chosen image there
 /// would load without the viewer opting in.
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-    style-src-attr 'unsafe-inline'; connect-src 'self'; frame-src 'self'; \
+    style-src-attr 'unsafe-inline'; connect-src 'self'; img-src 'self'; frame-src 'self'; \
     frame-ancestors 'self'; form-action 'self'; base-uri 'none'";
 const LOG_PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
     style-src-attr 'unsafe-inline'; connect-src 'self'; \
@@ -76,6 +86,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/", get(index))
         .route("/static/style.css", get(serve_css))
         .route("/static/app.js", get(serve_js))
+        .route("/static/icon-32.png", get(|| async { png(ICON) }))
+        .route(
+            "/static/apple-touch-icon.png",
+            get(|| async { png(TOUCH_ICON) }),
+        )
         .route("/ask/output/{filename}", get(serve_ask_output))
         .fallback(get(wildcard))
         .layer(map_response(security_headers))
@@ -135,6 +150,16 @@ async fn serve_css() -> impl IntoResponse {
             cache_control("public, max-age=86400, s-maxage=604800"),
         ],
         CSS,
+    )
+}
+
+fn png(body: &'static [u8]) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            cache_control("public, max-age=86400, s-maxage=604800"),
+        ],
+        body,
     )
 }
 
@@ -1809,6 +1834,8 @@ mod tests {
             ("/%23c/ask", CSP),
             ("/ask/output/x.html", CSP),
             ("/static/app.js", CSP),
+            ("/static/icon-32.png", CSP),
+            ("/static/apple-touch-icon.png", CSP),
         ] {
             let resp = app
                 .clone()
@@ -1823,6 +1850,14 @@ mod tests {
             let headers = resp.headers();
             assert_eq!(headers[header::CONTENT_SECURITY_POLICY], csp, "{uri}");
             assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{uri}");
+            if uri.ends_with(".png") {
+                assert_eq!(headers[header::CONTENT_TYPE], "image/png", "{uri}");
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"), "{uri}");
+                continue;
+            }
             if uri.ends_with(".js") {
                 continue;
             }
@@ -1831,6 +1866,11 @@ mod tests {
                 .unwrap();
             let body = String::from_utf8(body.to_vec()).unwrap();
             assert!(body.contains(&format!(r#"href="{}""#, *CSS_URL)), "{uri}");
+            assert!(body.contains(&format!(r#"href="{}""#, *ICON_URL)), "{uri}");
+            assert!(
+                body.contains(&format!(r#"href="{}""#, *TOUCH_ICON_URL)),
+                "{uri}"
+            );
             if !uri.starts_with("/ask/output/") {
                 assert!(body.contains(&format!(r#"src="{}""#, *JS_URL)), "{uri}");
             }

@@ -5,7 +5,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::parser::{LineKind, LogLine};
 use crate::search::SearchResults;
-use crate::server::{CSS_URL, JS_URL};
+use crate::server::{CSS_URL, ICON_URL, JS_URL, TOUCH_ICON_URL};
 use crate::{Channel, ChannelNode};
 
 fn nick_hue(nick: &str) -> u16 {
@@ -287,6 +287,15 @@ fn render_channel_tree(node: &ChannelNode, parent_path: &str, base_path: &str) -
     }
 }
 
+/// PNG only, no favicon.ico: the viewer may sit under a base path, where the
+/// root /favicon.ico a browser probes without these links is not its own.
+fn icon_links(base_path: &str) -> Markup {
+    html! {
+        link rel="icon" type="image/png" sizes="32x32" href=(format!("{base_path}{}", *ICON_URL));
+        link rel="apple-touch-icon" href=(format!("{base_path}{}", *TOUCH_ICON_URL));
+    }
+}
+
 pub fn page(title: &str, tree: &ChannelNode, base_path: &str, content: Markup) -> Markup {
     html! {
         (DOCTYPE)
@@ -295,6 +304,7 @@ pub fn page(title: &str, tree: &ChannelNode, base_path: &str, content: Markup) -
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
+                (icon_links(base_path))
                 link rel="stylesheet" href=(format!("{base_path}{}", *CSS_URL));
                 script src=(format!("{base_path}{}", *JS_URL)) defer {}
             }
@@ -572,6 +582,7 @@ pub fn ask_output_page(title: &str, md_filename: &str, content: &str, base_path:
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — " (md_filename) }
+                (icon_links(base_path))
                 link rel="stylesheet" href=(format!("{base_path}{}", *CSS_URL));
             }
             body {
