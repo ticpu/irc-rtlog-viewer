@@ -168,6 +168,7 @@ main {
 }
 
 #log.hide-events .event { display: none; }
+#log:not(.hide-events) .events-only { display: none; }
 
 .carried { opacity: 0.7; }
 

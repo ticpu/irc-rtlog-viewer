@@ -2086,6 +2086,40 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn search_hides_events_behind_the_show_events_toggle() {
+        let root = tempdir();
+        std::fs::write(
+            root.path()
+                .join("2026-01-01.log"),
+            "[10:00:00] *** Joins: needle (~n@host)\n[10:01:00] <a> hay\n",
+        )
+        .unwrap();
+        let mut channels = ChannelNode::default();
+        let dirs = vec![ChannelDir {
+            path: root
+                .path()
+                .to_owned(),
+            format: LogFormat::Znc,
+        }];
+        add_channel(&mut channels, &["#c"], dirs);
+        let app = app(Arc::new(app_state(channels, "logs_dirs: []")), PEER);
+
+        let note = "Only events matched";
+        let found = body_of(&app, "/%23c/search?q=needle").await;
+        assert!(
+            found.contains(r#"<input id="toggle-events" type="checkbox">"#),
+            "{found}"
+        );
+        assert!(
+            found.contains(r#"<div id="log" class="hide-events">"#),
+            "{found}"
+        );
+        assert!(found.contains(note), "{found}");
+        let found = body_of(&app, "/%23c/search?q=hay").await;
+        assert!(!found.contains(note), "{found}");
+    }
 }
 
 #[cfg(test)]

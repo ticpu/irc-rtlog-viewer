@@ -276,6 +276,17 @@ fn line_body(line: &LogLine, time: Option<LineTime>, day_url: &str) -> Markup {
     }
 }
 
+/// Starts unchecked over a log with class hide-events; app.js applies the
+/// saved choice to both.
+fn events_toggle() -> Markup {
+    html! {
+        label {
+            input id="toggle-events" type="checkbox";
+            " show events"
+        }
+    }
+}
+
 fn render_channel_tree(node: &ChannelNode, parent_path: &str, base_path: &str) -> Markup {
     html! {
         ul {
@@ -414,10 +425,7 @@ pub fn log_page(ctx: &LogPageContext) -> Markup {
                         " live status"
                     }
                     " "
-                    label {
-                        input id="toggle-events" type="checkbox";
-                        " show events"
-                    }
+                    (events_toggle())
                     " "
                     label title="Loads images, videos and YouTube players from the linked sites, which then see your address." {
                         input id="toggle-embeds" type="checkbox";
@@ -483,18 +491,22 @@ pub fn search_page(
             header id="log-header" {
                 h1 { (&channel.name) " — search" }
                 div.controls {
+                    (events_toggle())
+                    " "
                     form.search-form action=(format!("{base_path}/{encoded}/search")) method="get" {
                         input type="text" name="q" value=(query) placeholder="search…" maxlength=(max_query_len);
                         button type="submit" { "go" }
                     }
                 }
             }
-            div id="log" {
+            div id="log" class="hide-events" {
                 @if let Some(days) = results.stopped_at_days {
                     p.search-note { "Searched the newest " (days) " days; older logs were not searched." }
                 }
                 @if results.lines.is_empty() {
                     p { "no results for \"" (query) "\"" }
+                } @else if results.lines.iter().all(|found| found.line.is_event()) {
+                    p.search-note.events-only { "Only events matched; tick show events to see them." }
                 }
                 @for found in &results.lines {
                     @let date = &found.date;
